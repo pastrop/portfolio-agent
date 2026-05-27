@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Project run artefacts (regenerated on every run)
+harness_output.json
+harness_output.md
+viz/generated/
+
+# Secrets
+.env

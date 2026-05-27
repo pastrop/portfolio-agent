@@ -1,0 +1,19 @@
+[project]
+name = "portfolio-agent"
+version = "0.1.0"
+description = "Multi-agent portfolio optimization harness powered by Claude"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic>=0.52.2",
+    "claude-agent-sdk>=0.0.10",
+    "pandas>=2.2.0",
+    "yfinance>=0.2.40",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
+]
