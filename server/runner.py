@@ -172,6 +172,8 @@ def execute_run_sync(
     orig_planner = api.PLANNER_MODEL
     orig_advisor = api.ADVISOR_MODEL
     orig_max_iter = harness.MAX_ITERATIONS
+    orig_max_loss = harness.TARGET_MAX_LOSS
+    orig_under_band = harness.UNDER_UTILISATION_BAND
 
     # --- Resolve effective flags (test mode overrides explicit flags) ---
     if req.test:
@@ -193,6 +195,14 @@ def execute_run_sync(
         api.ADVISOR_MODEL = override_model
     if iterations is not None:
         harness.MAX_ITERATIONS = iterations
+    # --max-loss equivalent: patch TARGET_MAX_LOSS and recompute the
+    # auto-derived under-utilisation band so run_harness threads the new
+    # budget into every agent prompt and the selection target.
+    if req.max_loss is not None:
+        harness.TARGET_MAX_LOSS = req.max_loss
+        harness.UNDER_UTILISATION_BAND = (
+            harness.UNDER_UTILISATION_RATIO * req.max_loss
+        )
 
     stdout_log = artifacts_dir / ARTIFACT_NAMES["stdout_log"]
     trace_json = artifacts_dir / ARTIFACT_NAMES["trace_json"]
@@ -269,6 +279,8 @@ def execute_run_sync(
         api.PLANNER_MODEL = orig_planner
         api.ADVISOR_MODEL = orig_advisor
         harness.MAX_ITERATIONS = orig_max_iter
+        harness.TARGET_MAX_LOSS = orig_max_loss
+        harness.UNDER_UTILISATION_BAND = orig_under_band
         # --- Sentinel for any SSE consumer draining the queue ---
         try:
             log_queue.put_nowait(None)

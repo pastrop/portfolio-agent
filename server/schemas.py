@@ -54,6 +54,19 @@ class RunRequest(BaseModel):
             "count).  Ignored when test=true (which forces iterations=1)."
         ),
     )
+    max_loss: Optional[float] = Field(
+        None,
+        gt=0,
+        lt=1,
+        description=(
+            "Override TARGET_MAX_LOSS (the max annual loss budget) as a "
+            "fraction in (0, 1) — e.g. 0.10 for 10%. Drives the agent "
+            "prompts, the selection target, and the auto-derived "
+            "under-utilisation band. Mirrors `--max-loss` on the CLI; "
+            "applies in test mode too. When omitted, the harness default "
+            "is used."
+        ),
+    )
     refine: bool = Field(True, description="Run the post-selection Refiner pass.")
     advise: bool = Field(True, description="Run the Advisor passes (intra-loop + final).")
     price: bool = Field(True, description="Run the yfinance pricing / lot-size check.")

@@ -127,7 +127,7 @@ def run_planner(user_goal: str) -> InvestmentSpec:
 # ---------------------------------------------------------------------------
 # AGENT 2 — GENERATOR
 # ---------------------------------------------------------------------------
-GENERATOR_SYSTEM = textwrap.dedent("""\
+_GENERATOR_SYSTEM_TEMPLATE = textwrap.dedent("""\
     You are an expert quantitative portfolio constructor.
     You receive a detailed investment specification and (optionally) feedback
     from a previous QA round.  Your job is to produce a concrete portfolio
@@ -144,15 +144,15 @@ GENERATOR_SYSTEM = textwrap.dedent("""\
     4. If you received evaluator feedback, address every point raised.
 
     RISK BUDGET DISCIPLINE — IMPORTANT:
-    Treat the 5% max annual loss as a budget to be USED, not avoided.
+    Treat the {MAX_LOSS} max annual loss as a budget to be USED, not avoided.
     A portfolio with a 2% expected_max_drawdown is wasting risk capacity
     and almost certainly leaving return on the table.  Aim your
-    expected_max_drawdown as close to 5% as you honestly can WITHOUT
-    crossing it.  If prior feedback indicated you were over 5%, your top
+    expected_max_drawdown as close to {MAX_LOSS} as you honestly can WITHOUT
+    crossing it.  If prior feedback indicated you were over {MAX_LOSS}, your top
     priority this round is bringing the drawdown down — even at some cost
     to expected return.  If prior feedback indicated you were well under
-    5%, raise the return profile by deploying more risk-bearing exposure
-    until your drawdown is near (but under) 5%.
+    {MAX_LOSS}, raise the return profile by deploying more risk-bearing exposure
+    until your drawdown is near (but under) {MAX_LOSS}.
 
     DIVERSIFICATION — IMPORTANT:
     The portfolio must be diversified across genuinely independent risk
@@ -217,10 +217,17 @@ GENERATOR_SYSTEM = textwrap.dedent("""\
 """)
 
 
+def generator_system(max_loss: float) -> str:
+    """Render the Generator system prompt for a given max-loss budget."""
+    return _GENERATOR_SYSTEM_TEMPLATE.replace("{MAX_LOSS}", f"{max_loss:.0%}")
+
+
 def run_generator(
     spec: InvestmentSpec,
     feedback: str | None = None,
     iteration: int = 1,
+    *,
+    max_loss: float = 0.05,
 ) -> PortfolioProposal:
     print("\n" + "=" * 60)
     print(f"GENERATOR — building portfolio (iteration {iteration}) …")
@@ -231,7 +238,7 @@ def run_generator(
         user_msg += f"\nEVALUATOR FEEDBACK FROM PREVIOUS ROUND:\n{feedback}\n"
         user_msg += "\nAddress every issue raised.  Revise the portfolio accordingly."
 
-    raw = call_claude(GENERATOR_SYSTEM, user_msg)
+    raw = call_claude(generator_system(max_loss), user_msg)
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
     data = _parse_json_response(raw, agent="generator")
@@ -250,7 +257,7 @@ def run_generator(
 # ---------------------------------------------------------------------------
 # AGENT 3 — EVALUATOR
 # ---------------------------------------------------------------------------
-EVALUATOR_SYSTEM = textwrap.dedent("""\
+_EVALUATOR_SYSTEM_TEMPLATE = textwrap.dedent("""\
     You are a skeptical, rigorous portfolio risk analyst — the QA agent.
     Your job is to independently evaluate a proposed portfolio against an
     investment specification.  You must be TOUGH.  Do NOT give the benefit
@@ -280,10 +287,10 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
 
     The tool returns the PRE-MECHANISM gross loss.  Apply the spec's
     enforcement mechanism on top of that (see CRITERION 1 below) to
-    get the post-mechanism loss you judge against the 5% cap.
+    get the post-mechanism loss you judge against the {MAX_LOSS} cap.
 
     CRITERIA (graded 1-10):
-    1. CONSTRAINT COMPLIANCE — Does the portfolio stay within the ≤5%
+    1. CONSTRAINT COMPLIANCE — Does the portfolio stay within the ≤{MAX_LOSS}
        max annual loss constraint under realistic historical scenarios?
        Check: 2008 GFC, 2020 COVID crash, 2022 rate-hike drawdown.
 
@@ -293,16 +300,16 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
        hedge overlay, a rebalancing rule), MODEL that mechanism when
        computing each scenario's loss.  Apply the trigger logic (or
        hedge payoff) to the gross drawdown, then judge the
-       POST-mechanism net annual loss against the 5% cap.
+       POST-mechanism net annual loss against the {MAX_LOSS} cap.
 
-       A pre-mechanism gross loss above 5% is acceptable IF the
+       A pre-mechanism gross loss above {MAX_LOSS} is acceptable IF the
        mechanism plausibly contains the post-mechanism annual loss to
-       ≤ 5%.  The spec defined the mechanism; honour it.
+       ≤ {MAX_LOSS}.  The spec defined the mechanism; honour it.
 
        Score ≤ 4 only when either:
-         • The post-mechanism net annual loss STILL breaches 5% in a
+         • The post-mechanism net annual loss STILL breaches {MAX_LOSS} in a
            realistic scenario — i.e., even when the mechanism works
-           as designed, the portfolio would have lost more than 5% in
+           as designed, the portfolio would have lost more than {MAX_LOSS} in
            2008 / 2020 / 2022, OR
          • The mechanism is implausible for the scenario (e.g., a
            slow drawdown-trigger cannot catch a gap-down event large
@@ -312,10 +319,10 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
            scenario being modelled).
 
        ALSO score ≤ 6 if the expected_max_drawdown is materially BELOW
-       5% (e.g., under ~4%) without a specific constraint forcing that
-       level of conservatism — under-utilising the 5% risk budget is a
+       {MAX_LOSS} (e.g., well under it) without a specific constraint forcing that
+       level of conservatism — under-utilising the {MAX_LOSS} risk budget is a
        flaw, not a virtue, because it sacrifices return for no good
-       reason.  A portfolio that lands near (but under) 5% should score
+       reason.  A portfolio that lands near (but under) {MAX_LOSS} should score
        highest on this criterion; one that lands far below it should
        be marked down for wasting risk capacity.
 
@@ -355,10 +362,10 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
       • A binding hard-constraint violation (FX hedging, ticker cap,
         sector cap, leverage, instrument restrictions, etc.).
       • A realistic historical scenario where the POST-mechanism annual
-        loss still breaches the 5% cap — i.e., even crediting the
+        loss still breaches the {MAX_LOSS} cap — i.e., even crediting the
         spec's enforcement mechanism as designed, the portfolio would
-        have lost more than 5% in 2008 / 2020 / 2022.  A pre-mechanism
-        gross loss above 5% is NOT a fail on its own when the mechanism
+        have lost more than {MAX_LOSS} in 2008 / 2020 / 2022.  A pre-mechanism
+        gross loss above {MAX_LOSS} is NOT a fail on its own when the mechanism
         plausibly contains the post-mechanism loss.
       • Material methodology gaps that make the loss estimates
         unreliable (e.g., key scenarios not stress-tested at all,
@@ -390,20 +397,26 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
 """)
 
 
+def evaluator_system(max_loss: float) -> str:
+    """Render the Evaluator system prompt for a given max-loss budget."""
+    return _EVALUATOR_SYSTEM_TEMPLATE.replace("{MAX_LOSS}", f"{max_loss:.0%}")
+
+
 def run_evaluator(
     spec: InvestmentSpec,
     proposal: PortfolioProposal,
     *,
     pass_threshold: int = 7,
+    max_loss: float = 0.05,
 ) -> EvaluationResult:
     """
     Score the proposal on five criteria and produce a critique.  The
     composite ``passed`` flag is True only when (a) the average score is
     >= ``pass_threshold``, (b) no single score is <= 4, AND (c) the
     Evaluator's own ``passed`` judgement in the response is True — all
-    three must hold.  ``pass_threshold`` is the orchestrator's policy
-    knob (lives in ``harness.py``) and is passed in so this module
-    stays orchestrator-agnostic.
+    three must hold.  ``pass_threshold`` and ``max_loss`` are the
+    orchestrator's policy knobs (live in ``harness.py``) and are passed
+    in so this module stays orchestrator-agnostic.
     """
     print("\n" + "=" * 60)
     print("EVALUATOR — stress-testing the portfolio …")
@@ -415,7 +428,7 @@ def run_evaluator(
     )
 
     raw = call_claude(
-        EVALUATOR_SYSTEM, user_msg,
+        evaluator_system(max_loss), user_msg,
         tools=_BACKTEST_TOOLS,
         tool_handlers=_BACKTEST_HANDLERS,
         # 3 standard stress windows + headroom for sub-scenarios + final
@@ -453,7 +466,7 @@ def run_evaluator(
 # ---------------------------------------------------------------------------
 # AGENT 4 — REFINER  (post-selection fine-tuner)
 # ---------------------------------------------------------------------------
-REFINER_SYSTEM = textwrap.dedent("""\
+_REFINER_SYSTEM_TEMPLATE = textwrap.dedent("""\
     You are a senior portfolio fine-tuner.  Your input is:
       • An investment specification.
       • A portfolio that has already been selected as the best of several
@@ -471,14 +484,14 @@ REFINER_SYSTEM = textwrap.dedent("""\
     revised portfolio before emitting it — at minimum on 2008
     (start='2008-01-01', end='2008-12-31'), 2020 (start='2020-02-01',
     end='2020-12-31'), and 2022 (start='2022-01-01', end='2022-12-31').
-    If a backtest shows the revision still breaches the 5% cap (after
+    If a backtest shows the revision still breaches the {MAX_LOSS} cap (after
     accounting for the spec's enforcement_mechanism), iterate further
     before responding — don't ship weights you haven't verified.
 
     Hard rules:
-    1. Maintain the ≤5% max annual loss constraint under realistic
+    1. Maintain the ≤{MAX_LOSS} max annual loss constraint under realistic
        historical scenarios (2008, 2020, 2022).  Verify with the tool.
-    2. Aim expected_max_drawdown close to (but under) 5% — do NOT waste
+    2. Aim expected_max_drawdown close to (but under) {MAX_LOSS} — do NOT waste
        the risk budget by becoming overly conservative.
     3. Address EVERY distinct issue in the critique.  If the critique
        lists three separate problems, your revision must visibly address
@@ -506,21 +519,27 @@ REFINER_SYSTEM = textwrap.dedent("""\
 """)
 
 
+def refiner_system(max_loss: float) -> str:
+    """Render the Refiner system prompt for a given max-loss budget."""
+    return _REFINER_SYSTEM_TEMPLATE.replace("{MAX_LOSS}", f"{max_loss:.0%}")
+
+
 def run_refiner(
     spec: InvestmentSpec,
     selected_proposal: PortfolioProposal,
     selected_evaluation: EvaluationResult,
     *,
     max_iterations: int = 3,
+    max_loss: float = 0.05,
 ) -> PortfolioProposal:
     """
     Take the harness-selected portfolio plus the evaluator's critique and
     produce a single revised proposal that addresses every critique item.
 
     ``max_iterations`` is included in the Refiner's user prompt as
-    flavor text ("currently best of N candidates"); it's an orchestrator
-    policy knob (lives in ``harness.py``) and is passed in so this
-    module stays orchestrator-agnostic.
+    flavor text ("currently best of N candidates"); it and ``max_loss``
+    are orchestrator policy knobs (live in ``harness.py``) and are passed
+    in so this module stays orchestrator-agnostic.
     """
     print("\n" + "=" * 60)
     print("REFINER — fine-tuning the selected portfolio against critique …")
@@ -540,7 +559,7 @@ def run_refiner(
     )
 
     raw = call_claude(
-        REFINER_SYSTEM, user_msg,
+        refiner_system(max_loss), user_msg,
         max_tokens=api.REFINER_MAX_TOKENS,
         tools=_BACKTEST_TOOLS,
         tool_handlers=_BACKTEST_HANDLERS,

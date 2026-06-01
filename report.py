@@ -267,7 +267,7 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push(
                 "The Refiner addressed every critique point above, but the "
                 "refined portfolio **did not pass QA on re-evaluation** (or "
-                "exceeded the 5% drawdown target), so the originally "
+                f"exceeded the {target:.1%} drawdown target), so the originally "
                 "selected portfolio was kept as the final answer. Section "
                 "below shows what the Refiner produced for comparison."
             )
