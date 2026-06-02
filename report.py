@@ -550,6 +550,90 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
         push(f"_Pricing pass could not run — {pricing['error']}_")
         push("")
 
+    # ---- Return distribution (Monte-Carlo risk profile) ----
+    risk = result.get("risk_profile") or {}
+    if risk.get("performed"):
+        push("## Return Distribution (Monte-Carlo)")
+        push("")
+        if risk.get("disclaimer"):
+            push(f"> ⚠️ **How to read this.** {risk['disclaimer']}")
+            push("")
+
+        start = risk.get("sample_start", "")
+        end = risk.get("sample_end", "")
+        years = risk.get("sample_years", 0) or 0
+        incl08 = risk.get("includes_2008")
+        cov = float(risk.get("coverage_weight", 0) or 0)
+        ann_r = float(risk.get("annualized_return", 0) or 0)
+        ann_v = float(risk.get("annualized_vol", 0) or 0)
+        limiting = risk.get("limiting_ticker")
+
+        push(
+            f"- **Sample window:** {start} → {end} (~{years:g}y), "
+            f"{'**includes** the 2008 crisis' if incl08 else '⚠️ **does NOT include** 2008'}"
+        )
+        if not incl08 and limiting:
+            push(
+                f"  - window limited by `{limiting}` (no long-history proxy); "
+                f"tail estimates are correspondingly benign"
+            )
+        push(f"- **Coverage:** {cov:.0%} of the book modeled "
+             f"(realized sample: {ann_r:.1%} return, {ann_v:.1%} volatility)")
+
+        subs = risk.get("proxy_substitutions") or []
+        if subs:
+            sub_str = ", ".join(
+                f"`{s.get('original')}`→`{s.get('proxy')}`" for s in subs
+            )
+            push(f"- **Long-history proxies used:** {sub_str}")
+        dropped = risk.get("dropped_tickers") or []
+        if dropped:
+            dr = ", ".join(f"`{t}`" for t in dropped)
+            push(
+                f"- **Excluded (not priceable, e.g. option overlays):** {dr} "
+                f"— their weight was renormalized away, so the modeled "
+                f"downside is *more conservative* than the hedged portfolio"
+            )
+        push("")
+
+        horizons = risk.get("horizons") or []
+        if horizons:
+            push("Invest a lump sum today, look again after each horizon — "
+                 "where your money lands:")
+            push("")
+            push("| Horizon | Median outcome | Chance of ending down | "
+                 "Bad case (1-in-20) | Severe case (1-in-100) |")
+            push("|---------|---------------:|----------------------:|"
+                 "-------------------:|-----------------------:|")
+            for hz in horizons:
+                yrs = hz.get("horizon_years", 0)
+                med = float(hz.get("median", 0) or 0)
+                pdn = float(hz.get("prob_end_down", 0) or 0)
+                bad = float(hz.get("bad_5th", 0) or 0)
+                sev = float(hz.get("severe_1st", 0) or 0)
+                push(
+                    f"| {yrs} year{'s' if yrs != 1 else ''} | {med:+.0%} | "
+                    f"{pdn:.0%} | {bad:+.0%} | {sev:+.0%} |"
+                )
+            push("")
+            push(
+                "_**Median outcome** = the typical (50/50) total return. "
+                "**Chance of ending down** = probability you finish with less "
+                "than you started. **Bad / Severe case** = the 1-in-20 and "
+                "1-in-100 unlucky finishes._"
+            )
+            push("")
+    elif risk.get("skipped_reason"):
+        push("## Return Distribution (Monte-Carlo)")
+        push("")
+        push(f"_Risk-profile pass skipped — {risk['skipped_reason']}._")
+        push("")
+    elif risk.get("error"):
+        push("## Return Distribution (Monte-Carlo)")
+        push("")
+        push(f"_Risk-profile pass could not run — {risk['error']}_")
+        push("")
+
     # ---- Per-iteration detail ----
     push("## Iteration History (detailed)")
     push("")

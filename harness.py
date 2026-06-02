@@ -41,6 +41,7 @@ from models import (
 )
 from pricing import DEFAULT_CAPITAL, PRICING_DISCLAIMER, run_pricing
 from report import write_markdown_report
+from risk import RISK_DISCLAIMER, run_risk_profile
 
 # ---------------------------------------------------------------------------
 # Orchestrator-only policy constants
@@ -280,6 +281,7 @@ def run_harness(
     refine: bool = True,
     advise: bool = True,
     price: bool = True,
+    risk: bool = True,
     capital: float = DEFAULT_CAPITAL,
 ) -> dict[str, Any]:
     """
@@ -309,6 +311,11 @@ def run_harness(
          feasibility check against `capital` USD.  Per-ticker failures
          (unknown ticker, network blip, model-invented pseudo-ticker) are
          recorded gracefully and never abort the pipeline.
+      7. If `risk=True`, build a Monte-Carlo return-distribution profile
+         (block-bootstrap of historical returns, long-history asset-class
+         proxies for young ETFs) reporting median outcome / chance of
+         ending down / unlucky tails over several holding horizons.  Also
+         yfinance-backed and fail-soft.
     """
     # --- Step 1: Plan ---
     spec = run_planner(user_goal)
@@ -566,6 +573,27 @@ def run_harness(
             **asdict(pricing_result),
         }
 
+    # --- Step 8: Return-distribution risk profile (yfinance + Monte-Carlo) ---
+    risk_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": RISK_DISCLAIMER,
+        "error": None,
+    }
+    if not risk:
+        risk_block["skipped_reason"] = "disabled via --no-risk / --test"
+        print("\n(Risk-profile step skipped.)\n")
+    elif not final_proposal.allocations:
+        risk_block["skipped_reason"] = "no allocations to model"
+        print("\n(Risk-profile step skipped — no allocations.)\n")
+    else:
+        risk_result = run_risk_profile(final_proposal.allocations)
+        risk_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(risk_result),
+        }
+
     return {
         "model": api.MODEL,
         "max_iterations": MAX_ITERATIONS,
@@ -581,6 +609,7 @@ def run_harness(
         "refinement": refinement_block,
         "advisor": advisor_block,
         "pricing": pricing_block,
+        "risk_profile": risk_block,
     }
 
 
@@ -618,6 +647,7 @@ if __name__ == "__main__":
               uv run python harness.py --no-refine
               uv run python harness.py --no-advisor
               uv run python harness.py --no-prices
+              uv run python harness.py --no-risk
               uv run python harness.py --capital 250000
               uv run python harness.py --max-loss 0.10
         """),
@@ -682,6 +712,19 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--no-risk",
+        action="store_true",
+        help=(
+            "Skip the post-selection Risk-profile pass. By default, after "
+            "the final portfolio is determined, a Monte-Carlo "
+            "return-distribution profile is built (block-bootstrap of "
+            "historical returns, with long-history asset-class proxies for "
+            "young ETFs) reporting median outcome / chance of ending down / "
+            "unlucky tails per holding horizon. yfinance-backed and "
+            "fail-soft. --test implies --no-risk."
+        ),
+    )
+    parser.add_argument(
         "--max-loss",
         type=float,
         metavar="FRACTION",
@@ -711,6 +754,7 @@ if __name__ == "__main__":
     refine = not args.no_refine
     advise = not args.no_advisor
     price = not args.no_prices
+    risk = not args.no_risk
     capital = args.capital
     if args.test:
         # --test forces ALL agents to haiku (and disables everything else).
@@ -723,9 +767,10 @@ if __name__ == "__main__":
         refine = False   # --test always implies --no-refine
         advise = False   # --test always implies --no-advisor
         price = False    # --test always implies --no-prices
+        risk = False     # --test always implies --no-risk
         print(
             f"[TEST MODE] model={api.MODEL}  iterations={MAX_ITERATIONS}  "
-            f"refine={refine}  advise={advise}  price={price}"
+            f"refine={refine}  advise={advise}  price={price}  risk={risk}"
         )
     else:
         if args.model:
@@ -759,6 +804,8 @@ if __name__ == "__main__":
             print("[pricing disabled]")
         else:
             print(f"[pricing enabled  capital=${capital:,.0f}]")
+        if not risk:
+            print("[risk profile disabled]")
 
     # --max-loss applies in both --test and normal modes (orthogonal to
     # model / iteration overrides).  Patching TARGET_MAX_LOSS here means
@@ -787,6 +834,7 @@ if __name__ == "__main__":
         refine=refine,
         advise=advise,
         price=price,
+        risk=risk,
         capital=capital,
     )
 

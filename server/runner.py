@@ -180,11 +180,13 @@ def execute_run_sync(
         refine = False
         advise = False
         price = False
+        risk = False
         iterations: Optional[int] = 1
     else:
         refine = req.refine
         advise = req.advise
         price = req.price
+        risk = req.risk
         iterations = req.iterations
 
     # --- Apply patches ---
@@ -225,7 +227,7 @@ def execute_run_sync(
                 f"\n[run {artifacts_dir.name}] starting "
                 f"(model_override={override_model or '<per-agent mix>'}, "
                 f"iterations={iterations if iterations is not None else harness.MAX_ITERATIONS}, "
-                f"refine={refine}, advise={advise}, price={price})\n"
+                f"refine={refine}, advise={advise}, price={price}, risk={risk})\n"
             )
             _REAL_STDOUT.flush()
 
@@ -236,6 +238,7 @@ def execute_run_sync(
                         refine=refine,
                         advise=advise,
                         price=price,
+                        risk=risk,
                         capital=req.capital,
                     )
                 except Exception as exc:

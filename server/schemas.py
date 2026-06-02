@@ -70,6 +70,14 @@ class RunRequest(BaseModel):
     refine: bool = Field(True, description="Run the post-selection Refiner pass.")
     advise: bool = Field(True, description="Run the Advisor passes (intra-loop + final).")
     price: bool = Field(True, description="Run the yfinance pricing / lot-size check.")
+    risk: bool = Field(
+        True,
+        description=(
+            "Run the post-selection Monte-Carlo return-distribution profile "
+            "(block-bootstrap with long-history proxies). Mirrors `--no-risk` "
+            "on the CLI (set false to skip). Ignored when test=true."
+        ),
+    )
     capital: float = Field(
         100_000.0,
         gt=0,
