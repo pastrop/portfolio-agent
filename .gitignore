@@ -15,5 +15,11 @@ harness_output.json
 harness_output.md
 viz/generated/
 
+# Server per-run artefact directories (server/jobs.py writes one per run)
+runs/
+
 # Secrets
 .env
+
+# Local-only session notes for fresh Claude Code sessions
+SESSION_NOTES.md

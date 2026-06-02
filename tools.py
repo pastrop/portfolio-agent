@@ -41,8 +41,8 @@ COMPUTE_BACKTEST_TOOL: dict[str, Any] = {
         "Returns total return, max drawdown, volatility, best/worst day, "
         "and (importantly) which tickers had no data in the range "
         "(some ETFs didn't exist in 2008 — e.g., DBMF launched 2019). "
-        "Use this to score constraint compliance against the 5% loss cap "
-        "with real numbers instead of estimating losses from memory."
+        "Use this to score constraint compliance against the spec's loss "
+        "cap with real numbers instead of estimating losses from memory."
     ),
     "input_schema": {
         "type": "object",

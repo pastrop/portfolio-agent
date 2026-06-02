@@ -41,6 +41,7 @@ from models import (
 )
 from pricing import DEFAULT_CAPITAL, PRICING_DISCLAIMER, run_pricing
 from report import write_markdown_report
+from risk import RISK_DISCLAIMER, run_risk_profile
 
 # ---------------------------------------------------------------------------
 # Orchestrator-only policy constants
@@ -51,8 +52,13 @@ from report import write_markdown_report
 # or --model X is provided.)
 MAX_ITERATIONS = 3          # generator ↔ evaluator rounds
 PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
-TARGET_MAX_LOSS = 0.05      # 5% — the loss budget we want expected_max_drawdown to land on
-UNDER_UTILISATION_BAND = 0.04  # below this we consider the risk budget under-utilised
+TARGET_MAX_LOSS = 0.05      # default loss budget we want expected_max_drawdown to land on (overridable via --max-loss)
+# The under-utilisation band auto-derives from TARGET_MAX_LOSS: a drawdown
+# below this fraction of the budget is "wasting risk capacity".  Whenever
+# TARGET_MAX_LOSS is patched (CLI --max-loss, server runner), recompute
+# UNDER_UTILISATION_BAND = UNDER_UTILISATION_RATIO * TARGET_MAX_LOSS.
+UNDER_UTILISATION_RATIO = 0.8
+UNDER_UTILISATION_BAND = UNDER_UTILISATION_RATIO * TARGET_MAX_LOSS
 # Threshold for which Advisor-flagged correlation pairs count as
 # actionable feedback for the next Generator iteration.  The Advisor
 # surfaces pairs at |ρ| ≥ 0.5 for the report, but for prompt feedback
@@ -179,14 +185,15 @@ def _build_feedback(
     Produce the next round's feedback string based on the current evaluation.
 
     Three regimes (selects the BASE feedback text):
-      • Failed QA          → pass the critique through unchanged (today's behaviour).
-      • Passed but over 5% → tell the generator to bring drawdown down to ~5%
-                              without sacrificing scores.
+      • Failed QA              → pass the critique through unchanged (today's behaviour).
+      • Passed but over target → tell the generator to bring drawdown down to
+                                 ~TARGET_MAX_LOSS without sacrificing scores.
       • Passed but well
-        under 5%           → tell the generator the risk budget is being wasted
-                              and to push drawdown closer to (but under) 5%.
-      • Passed and near 5% → still ask for a refinement attempt — the selector
-                              will keep the best across iterations.
+        under target           → tell the generator the risk budget is being
+                                 wasted and to push drawdown closer to (but
+                                 under) TARGET_MAX_LOSS.
+      • Passed and near target → still ask for a refinement attempt — the
+                                 selector will keep the best across iterations.
 
     If ``advisor_output`` is provided, its concrete correlation-pair
     findings (≥ ``ADVISOR_FEEDBACK_RHO_THRESHOLD``) are prepended to the
@@ -250,7 +257,7 @@ def _select_best_iteration(history: list[dict]) -> int | None:
     the unbiased first attempt is usually the most balanced result.
 
     Selection key (smaller is better):
-      1. |expected_max_drawdown - TARGET_MAX_LOSS|   — closeness to the 5% target
+      1. |expected_max_drawdown - TARGET_MAX_LOSS|   — closeness to the loss target
       2. expected_max_drawdown                       — prefer smaller drawdown on tie
       3. -average_score                              — prefer higher score on tie
     """
@@ -274,6 +281,7 @@ def run_harness(
     refine: bool = True,
     advise: bool = True,
     price: bool = True,
+    risk: bool = True,
     capital: float = DEFAULT_CAPITAL,
 ) -> dict[str, Any]:
     """
@@ -303,6 +311,11 @@ def run_harness(
          feasibility check against `capital` USD.  Per-ticker failures
          (unknown ticker, network blip, model-invented pseudo-ticker) are
          recorded gracefully and never abort the pipeline.
+      7. If `risk=True`, build a Monte-Carlo return-distribution profile
+         (block-bootstrap of historical returns, long-history asset-class
+         proxies for young ETFs) reporting median outcome / chance of
+         ending down / unlucky tails over several holding horizons.  Also
+         yfinance-backed and fail-soft.
     """
     # --- Step 1: Plan ---
     spec = run_planner(user_goal)
@@ -314,10 +327,15 @@ def run_harness(
 
     for i in range(1, MAX_ITERATIONS + 1):
         # --- Step 2: Generate ---
-        proposal = run_generator(spec, feedback=feedback, iteration=i)
+        proposal = run_generator(
+            spec, feedback=feedback, iteration=i, max_loss=TARGET_MAX_LOSS,
+        )
 
         # --- Step 3: Evaluate ---
-        evaluation = run_evaluator(spec, proposal, pass_threshold=PASS_THRESHOLD)
+        evaluation = run_evaluator(
+            spec, proposal,
+            pass_threshold=PASS_THRESHOLD, max_loss=TARGET_MAX_LOSS,
+        )
 
         proposals.append(proposal)
         evaluations.append(evaluation)
@@ -441,10 +459,11 @@ def run_harness(
     else:
         refined_proposal = run_refiner(
             spec, selected_proposal, selected_evaluation,
-            max_iterations=MAX_ITERATIONS,
+            max_iterations=MAX_ITERATIONS, max_loss=TARGET_MAX_LOSS,
         )
         refined_evaluation = run_evaluator(
-            spec, refined_proposal, pass_threshold=PASS_THRESHOLD,
+            spec, refined_proposal,
+            pass_threshold=PASS_THRESHOLD, max_loss=TARGET_MAX_LOSS,
         )
 
         print(f"\n--- Refinement result ---")
@@ -554,6 +573,27 @@ def run_harness(
             **asdict(pricing_result),
         }
 
+    # --- Step 8: Return-distribution risk profile (yfinance + Monte-Carlo) ---
+    risk_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": RISK_DISCLAIMER,
+        "error": None,
+    }
+    if not risk:
+        risk_block["skipped_reason"] = "disabled via --no-risk / --test"
+        print("\n(Risk-profile step skipped.)\n")
+    elif not final_proposal.allocations:
+        risk_block["skipped_reason"] = "no allocations to model"
+        print("\n(Risk-profile step skipped — no allocations.)\n")
+    else:
+        risk_result = run_risk_profile(final_proposal.allocations)
+        risk_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(risk_result),
+        }
+
     return {
         "model": api.MODEL,
         "max_iterations": MAX_ITERATIONS,
@@ -569,6 +609,7 @@ def run_harness(
         "refinement": refinement_block,
         "advisor": advisor_block,
         "pricing": pricing_block,
+        "risk_profile": risk_block,
     }
 
 
@@ -606,7 +647,9 @@ if __name__ == "__main__":
               uv run python harness.py --no-refine
               uv run python harness.py --no-advisor
               uv run python harness.py --no-prices
+              uv run python harness.py --no-risk
               uv run python harness.py --capital 250000
+              uv run python harness.py --max-loss 0.10
         """),
     )
     parser.add_argument(
@@ -669,6 +712,32 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--no-risk",
+        action="store_true",
+        help=(
+            "Skip the post-selection Risk-profile pass. By default, after "
+            "the final portfolio is determined, a Monte-Carlo "
+            "return-distribution profile is built (block-bootstrap of "
+            "historical returns, with long-history asset-class proxies for "
+            "young ETFs) reporting median outcome / chance of ending down / "
+            "unlucky tails per holding horizon. yfinance-backed and "
+            "fail-soft. --test implies --no-risk."
+        ),
+    )
+    parser.add_argument(
+        "--max-loss",
+        type=float,
+        metavar="FRACTION",
+        help=(
+            "Override the max annual loss budget, as a fraction in (0, 1) "
+            f"— e.g. 0.10 for 10%% (default {TARGET_MAX_LOSS * 100:.0f}%%). "
+            "Drives the Generator/Evaluator/Refiner prompts, the selection "
+            "target, and the under-utilisation band (which auto-derives as "
+            f"{UNDER_UTILISATION_RATIO * 100:.0f}%% of this value). Applies "
+            "in --test mode too."
+        ),
+    )
+    parser.add_argument(
         "--capital",
         type=float,
         default=DEFAULT_CAPITAL,
@@ -685,6 +754,7 @@ if __name__ == "__main__":
     refine = not args.no_refine
     advise = not args.no_advisor
     price = not args.no_prices
+    risk = not args.no_risk
     capital = args.capital
     if args.test:
         # --test forces ALL agents to haiku (and disables everything else).
@@ -697,9 +767,10 @@ if __name__ == "__main__":
         refine = False   # --test always implies --no-refine
         advise = False   # --test always implies --no-advisor
         price = False    # --test always implies --no-prices
+        risk = False     # --test always implies --no-risk
         print(
             f"[TEST MODE] model={api.MODEL}  iterations={MAX_ITERATIONS}  "
-            f"refine={refine}  advise={advise}  price={price}"
+            f"refine={refine}  advise={advise}  price={price}  risk={risk}"
         )
     else:
         if args.model:
@@ -733,13 +804,29 @@ if __name__ == "__main__":
             print("[pricing disabled]")
         else:
             print(f"[pricing enabled  capital=${capital:,.0f}]")
+        if not risk:
+            print("[risk profile disabled]")
+
+    # --max-loss applies in both --test and normal modes (orthogonal to
+    # model / iteration overrides).  Patching TARGET_MAX_LOSS here means
+    # run_harness threads it into every agent prompt and the selection
+    # target; recompute the auto-derived under-utilisation band to match.
+    if args.max_loss is not None:
+        if not 0 < args.max_loss < 1:
+            parser.error("--max-loss must be a fraction in (0, 1), e.g. 0.10")
+        TARGET_MAX_LOSS = args.max_loss
+        UNDER_UTILISATION_BAND = UNDER_UTILISATION_RATIO * TARGET_MAX_LOSS
+        print(
+            f"[max-loss override] {TARGET_MAX_LOSS:.0%} "
+            f"(under-utilisation band {UNDER_UTILISATION_BAND:.0%})"
+        )
 
     goal = (
         "Optimise a portfolio for a US-based retail investor. "
         "Maximise annual return while ensuring the portfolio can lose "
-        "no more than 5% of its invested value in any given year. "
-        "Use any instruments available to a typical retail investor "
-        "(stocks, ETFs, bonds, options overlays, etc.)."
+        f"no more than {TARGET_MAX_LOSS:.0%} of its invested value in any "
+        "given year. Use any instruments available to a typical retail "
+        "investor (stocks, ETFs, bonds, options overlays, etc.)."
     )
 
     result = run_harness(
@@ -747,6 +834,7 @@ if __name__ == "__main__":
         refine=refine,
         advise=advise,
         price=price,
+        risk=risk,
         capital=capital,
     )
 
