@@ -99,13 +99,71 @@ PLANNER_SYSTEM = textwrap.dedent("""\
 """)
 
 
-def run_planner(user_goal: str) -> InvestmentSpec:
+def _investor_profile_block(horizon_years: int, posture: dict) -> str:
+    """
+    Render the horizon-aware INVESTOR PROFILE hard-constraint block injected
+    into the Planner's USER message (optimized regime, horizon >= 3y).
+
+    The harness derives the glide-path posture deterministically (label +
+    growth ceiling) and passes it in; this block translates it into an
+    explicit, machine-honoured constraint for the downstream construction
+    agents: cap GROWTH-asset weight (equity + REIT + commodity + high-yield)
+    at the ceiling, and fill the remainder with high-grade bonds / TIPS /
+    cash.  The Evaluator enforces the ceiling mechanically (see
+    ``run_evaluator``'s ``growth_ceiling`` check), so this is not a polite
+    suggestion — the spec must encode it as a binding constraint.
+    """
+    ceiling = posture["growth_ceiling"]
+    return textwrap.dedent(f"""\
+        INVESTOR PROFILE — HARD CONSTRAINTS (horizon-derived, binding):
+        • Investment horizon: {horizon_years} year(s).
+        • Risk posture: {posture['label']} (glide-path band {posture['band']}).
+        • GROWTH-ASSET CEILING: the combined weight of growth assets —
+          equity (US / international / EM / factor / dividend / small-cap),
+          REITs, broad commodities, gold, managed futures, and HIGH-YIELD
+          credit — MUST NOT exceed {ceiling:.0%} of the portfolio.
+        • The REMAINDER (at least {1 - ceiling:.0%}) MUST be high-grade
+          defensive assets: investment-grade / Treasury / aggregate bonds,
+          TIPS / inflation-linked, and cash / T-bills.
+        • The max annual loss budget still applies INDEPENDENTLY: keep the
+          portfolio within its stated max-loss constraint AND under this
+          growth ceiling — whichever binds tighter wins.
+        Bake these limits into the spec's `constraints` and `risk_budget`
+        fields as explicit, numeric rules so the construction engine can
+        honour them.
+    """)
+
+
+def run_planner(
+    user_goal: str,
+    *,
+    horizon_years: int = 10,
+    posture: dict | None = None,
+) -> InvestmentSpec:
+    """
+    Expand the user goal into a full investment spec.
+
+    When ``posture`` is provided (the harness's deterministic glide-path
+    result for ``horizon_years``), an INVESTOR PROFILE hard-constraint block
+    is prepended to the Planner's USER message so the spec encodes the
+    horizon-derived growth-asset ceiling.  When ``posture`` is None the
+    behaviour is byte-identical to the pre-horizon Planner (back-compat for
+    any caller that does not pass a posture).
+    """
     print("\n" + "=" * 60)
     print("PLANNER — expanding user goal into investment spec …")
     print("=" * 60)
 
+    user_msg = user_goal
+    if posture is not None:
+        user_msg = (
+            _investor_profile_block(horizon_years, posture)
+            + "\n"
+            + user_goal
+        )
+
     raw = call_claude(
-        PLANNER_SYSTEM, user_goal,
+        PLANNER_SYSTEM, user_msg,
         model=api.PLANNER_MODEL,
         max_tokens=api.PLANNER_MAX_TOKENS,   # spec + web_search needs >4096
         tools=_PLANNER_TOOLS,                # web_search (server-side)
@@ -408,6 +466,7 @@ def run_evaluator(
     *,
     pass_threshold: int = 7,
     max_loss: float = 0.05,
+    growth_ceiling: float | None = None,
 ) -> EvaluationResult:
     """
     Score the proposal on five criteria and produce a critique.  The
@@ -417,6 +476,14 @@ def run_evaluator(
     three must hold.  ``pass_threshold`` and ``max_loss`` are the
     orchestrator's policy knobs (live in ``harness.py``) and are passed
     in so this module stays orchestrator-agnostic.
+
+    When ``growth_ceiling`` is not None (the horizon glide-path ceiling),
+    an additional DETERMINISTIC, MECHANICAL gate runs on top of the LLM
+    judgement: the portfolio's growth-asset weight is measured via the
+    shared classifier (``harness.growth_asset_weight``) and, if it EXCEEDS
+    the ceiling, ``passed`` is forced False and a specific critique line is
+    appended.  This gate can only turn a pass into a fail, never the
+    reverse — it cannot rescue an LLM-failed proposal.
     """
     print("\n" + "=" * 60)
     print("EVALUATOR — stress-testing the portfolio …")
@@ -454,11 +521,34 @@ def run_evaluator(
         and model_said_passed
     )
 
+    critique = data.get("critique", "")
+
+    # --- Deterministic growth-ceiling gate (horizon glide path) ---------
+    # A hard, mechanical check ON TOP of the LLM judgement.  Lazy import of
+    # the shared classifier from harness avoids a circular import at module
+    # load (harness imports this module at its top).  This can only turn a
+    # pass into a fail — never the reverse.
+    if growth_ceiling is not None:
+        from harness import growth_asset_weight  # lazy — avoids import cycle
+        measured = growth_asset_weight(proposal)
+        if measured > growth_ceiling + 1e-9:
+            passed = False
+            ceiling_note = (
+                f"GROWTH-CEILING VIOLATION (deterministic check): measured "
+                f"growth-asset weight {measured:.1%} EXCEEDS the horizon "
+                f"ceiling of {growth_ceiling:.0%}. Growth assets (equity, "
+                f"REITs, commodities, gold, managed futures, high-yield "
+                f"credit) must be reduced to at or below {growth_ceiling:.0%}, "
+                f"with the remainder in high-grade bonds / TIPS / cash. "
+                f"Forced QA FAIL regardless of scores."
+            )
+            critique = (critique + "\n\n" + ceiling_note) if critique else ceiling_note
+
     return EvaluationResult(
         passed=passed,
         scores=scores,
         average_score=round(avg, 2),
-        critique=data.get("critique", ""),
+        critique=critique,
         raw_text=raw,
     )
 

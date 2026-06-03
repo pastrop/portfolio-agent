@@ -41,7 +41,7 @@ from models import (
 )
 from pricing import DEFAULT_CAPITAL, PRICING_DISCLAIMER, run_pricing
 from report import write_markdown_report
-from risk import RISK_DISCLAIMER, run_risk_profile
+from risk import RISK_DISCLAIMER, RISK_PROXY_MAP, run_risk_profile
 
 # ---------------------------------------------------------------------------
 # Orchestrator-only policy constants
@@ -65,6 +65,267 @@ UNDER_UTILISATION_BAND = UNDER_UTILISATION_RATIO * TARGET_MAX_LOSS
 # we only want the egregious overlaps (≥ 0.7) so the next prompt
 # isn't cluttered with marginal pairs.
 ADVISOR_FEEDBACK_RHO_THRESHOLD = 0.7
+
+# ---------------------------------------------------------------------------
+# Horizon policy (Phase 2) — horizon = risk CAPACITY
+# ---------------------------------------------------------------------------
+# `--horizon-years N` makes the recommended portfolio horizon-aware.  The
+# mental model: horizon is risk *capacity*; `--max-loss` is risk *tolerance*.
+# They bind independently and the MORE CONSERVATIVE wins.  At long horizons
+# the max-loss budget binds (≈ today's output); at short horizons the
+# horizon ceiling binds.
+#
+# DEFAULT_HORIZON_YEARS is 10 deliberately: a no-flag run lands in the
+# topmost glide-path band (90% growth ceiling, which never bites a sane
+# max-loss-constrained book) and so reproduces today's output byte-for-byte.
+# This is the Phase 2 acceptance gate — do NOT change it without re-baselining
+# harness_output.json.
+DEFAULT_HORIZON_YEARS = 10
+# Hard floor: anything below this short-circuits to a deterministic
+# capital-preservation template and the optimizer NEVER runs (no LLM agents).
+# There is no escape hatch — a 2-year horizon has no business holding an
+# equity-heavy book regardless of stated risk tolerance.
+HORIZON_FLOOR_YEARS = 3
+
+# Glide path (optimizer regime, horizon_years >= 3): a ceiling on the
+# combined weight of GROWTH assets (equity + REIT + commodity + high-yield).
+# The remainder must be high-grade bonds / TIPS / cash.  Bands are
+# HALF-OPEN on the right: [low, high).  An ordered list so the first band
+# whose [low, high) contains the horizon wins; the final band runs to
+# infinity (encoded as ``None`` high).
+#   horizon 3 -> 0.50,  horizon 5 -> 0.75,  horizon 10 -> 0.90.
+HORIZON_GLIDE_PATH: list[dict[str, Any]] = [
+    {"low": 3,  "high": 5,    "label": "Conservative balanced", "band": "3-5y",  "growth_ceiling": 0.50},
+    {"low": 5,  "high": 10,   "label": "Balanced growth",       "band": "5-10y", "growth_ceiling": 0.75},
+    {"low": 10, "high": None, "label": "Growth",                "band": "10y+",  "growth_ceiling": 0.90},
+]
+
+# Preservation templates (short-circuit regime, horizon_years < 3): fixed,
+# deterministic allocations — no LLM judgement, no optimisation.  These ARE
+# the answer below the floor.
+#   1 <= horizon < 3 -> "1-3y";  horizon < 1 -> "<1y".
+PRESERVATION_TEMPLATES: dict[str, dict[str, float]] = {
+    "1-3y": {"SGOV": 0.40, "SHY": 0.40, "VTIP": 0.20},
+    "<1y":  {"SGOV": 1.00},
+}
+# Posture label reported for any preservation-mode run.
+PRESERVATION_POSTURE = "Capital preservation"
+
+# ---------------------------------------------------------------------------
+# Growth-asset classifier (shared with the Evaluator's deterministic ceiling
+# check in agents.py via `growth_asset_weight`)
+# ---------------------------------------------------------------------------
+# The glide path caps GROWTH-asset weight, but PortfolioProposal has NO
+# structured asset-class field (allocations is just ticker -> weight), so we
+# must classify each holding ourselves.  This is a heuristic, FAIL-SOFT
+# classifier — it errs toward counting an *unclassifiable* holding AS growth
+# (the conservative choice for a ceiling check: an unknown sleeve can only
+# tighten the gate, never loosen it, so the deterministic Evaluator check can
+# never wave through a genuinely over-the-ceiling book on a classification
+# miss).
+#
+# "Growth" = equity (US / international / EM / factor / dividend / small-cap),
+# REITs, broad commodities, gold, managed futures, and HIGH-YIELD credit —
+# i.e. the spec's growth bucket plus the risk sleeves that behave like it.
+# "Defensive" = high-grade bonds (Treasuries, IG credit, aggregate, munis),
+# TIPS / inflation-linked, and cash / T-bills.  Options overlays and explicit
+# CASH/USD sleeves are treated as defensive (they don't consume the growth
+# budget).
+#
+# Three classification signals, in priority order:
+#   1. Exact ticker membership in the curated growth / defensive sets below
+#      (built from the Generator prompt's overlap groups + risk.RISK_PROXY_MAP
+#      so every proxy'd young ETF resolves too).
+#   2. The risk.RISK_PROXY_MAP long-history proxy (e.g. SCHD -> VIG): if the
+#      proxy is classifiable, inherit its class.
+#   3. Keyword scan of the holding's one-line description (e.g. "equity",
+#      "REIT", "high yield", "treasury", "TIPS", "cash") as a last resort.
+# Anything still unresolved -> counted as growth (fail-soft, see above).
+
+# Defensive tickers: high-grade bonds, TIPS, cash.  (Drawn from the Generator
+# overlap groups + the bond/cash/TIPS entries of RISK_PROXY_MAP's domain.)
+_DEFENSIVE_TICKERS: frozenset[str] = frozenset({
+    # intermediate Treasuries
+    "IEF", "GOVT", "VGIT", "SCHR",
+    # long Treasuries
+    "TLT", "EDV", "VGLT", "SPTL",
+    # short Treasuries / cash / T-bills
+    "SHV", "SHY", "BIL", "SGOV", "GBIL",
+    # investment-grade credit
+    "LQD", "VCIT", "VCSH", "IGIB", "IGSB",
+    # US aggregate bonds
+    "AGG", "BND", "SCHZ", "IUSB",
+    # TIPS / inflation-linked
+    "TIP", "SCHP", "VTIP", "STIP", "LTPZ",
+    # municipal bonds
+    "MUB", "VTEB", "TFI", "SUB", "VWITX",
+})
+# Growth tickers: equity (broad / factor / dividend / small-cap / int'l / EM),
+# REITs, gold, broad commodities, managed futures, high-yield credit.
+_GROWTH_TICKERS: frozenset[str] = frozenset({
+    # US broad equity
+    "VOO", "VTI", "SPY", "IVV", "SPLG", "ITOT", "SCHB",
+    # US large-cap factor tilts
+    "QUAL", "MTUM", "VLUE", "USMV", "SPHQ", "SPLV",
+    # US dividend tilts
+    "SCHD", "DGRO", "VYM", "HDV", "NOBL", "DVY", "VIG",
+    # US small-cap
+    "IWM", "VB", "IJR", "SCHA", "VTWO",
+    # int'l developed equity
+    "VEA", "IEFA", "VXUS", "SCHF", "IDEV", "EFA",
+    # emerging-market equity
+    "VWO", "IEMG", "EEM", "SCHE", "SPEM",
+    # high-yield credit (behaves like equity in stress -> growth bucket)
+    "HYG", "JNK", "USHY", "SHYG",
+    # gold
+    "GLD", "IAU", "GLDM", "SGOL", "BAR",
+    # broad commodities
+    "DBC", "PDBC", "GSG", "BCI", "COMT",
+    # US REITs
+    "VNQ", "IYR", "SCHH", "XLRE", "RWR",
+    # managed futures
+    "DBMF", "KMLM", "CTA", "WTMF",
+})
+# Description keywords, scanned only when ticker + proxy both miss.  Order
+# matters: a defensive keyword wins over a growth one ONLY when no growth
+# keyword is present (so "high-yield bond" -> growth, "treasury bond" ->
+# defensive).
+_GROWTH_KEYWORDS: tuple[str, ...] = (
+    "equity", "stock", "s&p", "nasdaq", "reit", "real estate", "commodit",
+    "gold", "managed futures", "high yield", "high-yield", "emerging",
+    "small-cap", "small cap", "dividend",
+)
+_DEFENSIVE_KEYWORDS: tuple[str, ...] = (
+    "treasury", "t-bill", "bill", "tips", "inflation-linked", "inflation linked",
+    "aggregate bond", "investment-grade", "investment grade", "municipal",
+    "muni", "cash", "money market", "money-market", "government bond",
+)
+
+
+def _classify_holding(ticker: str, description: str = "") -> str:
+    """
+    Classify a single holding as ``"growth"`` or ``"defensive"``.
+
+    FAIL-SOFT: an unclassifiable holding returns ``"growth"`` so that the
+    Evaluator's ceiling check can only ever be tightened — never loosened —
+    by a classification miss (an unknown sleeve must not silently buy room
+    under the growth ceiling).  See the module-level note above for the
+    full rationale and the three-signal priority order.
+    """
+    t = (ticker or "").strip().upper()
+    if t in _DEFENSIVE_TICKERS:
+        return "defensive"
+    if t in _GROWTH_TICKERS:
+        return "growth"
+
+    # Signal 2: inherit the long-history proxy's class, if it resolves.
+    proxy = RISK_PROXY_MAP.get(t)
+    if proxy is not None:
+        p = proxy.upper()
+        if p in _DEFENSIVE_TICKERS:
+            return "defensive"
+        if p in _GROWTH_TICKERS:
+            return "growth"
+
+    # Signal 3: keyword scan of the description.  A growth keyword wins over
+    # a defensive one (so "high-yield bond" lands in growth).
+    desc = (description or "").lower()
+    if any(kw in desc for kw in _GROWTH_KEYWORDS):
+        return "growth"
+    if any(kw in desc for kw in _DEFENSIVE_KEYWORDS):
+        return "defensive"
+
+    # Explicit cash sleeves the keyword list might miss.
+    if t in {"CASH", "USD", "MONEY_MARKET"}:
+        return "defensive"
+    # Options overlays / hedges named like SPX_PUT_SPREAD: a hedge is not a
+    # growth asset, so treat any holding whose name screams "hedge/put/option"
+    # as defensive rather than fail-soft growth.
+    if any(kw in t for kw in ("PUT", "HEDGE", "OPTION", "COLLAR")):
+        return "defensive"
+
+    # Fail-soft default: count the unknown holding as growth.
+    return "growth"
+
+
+def growth_asset_weight(proposal: PortfolioProposal) -> float:
+    """
+    Return the combined weight of GROWTH assets in ``proposal``'s
+    allocations, as a fraction in [0, 1] (normalised by the total weight so
+    a book whose weights don't sum to exactly 1.0 still yields a comparable
+    fraction).
+
+    This is the shared classifier behind the glide-path ceiling: the harness
+    uses it for diagnostics and the Evaluator (in ``agents.py``) imports it
+    for its deterministic, hard pass/fail growth-ceiling check.  See the
+    classifier note above for the heuristic + its fail-soft contract.
+    """
+    allocations = proposal.allocations or {}
+    descriptions = proposal.descriptions or {}
+    total = 0.0
+    growth = 0.0
+    for ticker, weight in allocations.items():
+        try:
+            w = abs(float(weight))
+        except (TypeError, ValueError):
+            continue
+        total += w
+        if _classify_holding(ticker, descriptions.get(ticker, "")) == "growth":
+            growth += w
+    if total <= 0:
+        return 0.0
+    return growth / total
+
+
+# ---------------------------------------------------------------------------
+# Horizon helpers
+# ---------------------------------------------------------------------------
+def posture_for_horizon(horizon_years: int) -> dict[str, Any]:
+    """
+    Resolve the glide-path posture for an OPTIMIZED-regime horizon
+    (``horizon_years >= HORIZON_FLOOR_YEARS``).
+
+    Returns ``{"label", "growth_ceiling", "band", "horizon_years"}`` — the
+    first band whose half-open ``[low, high)`` interval contains the
+    horizon.  Horizons at or above the last band's ``low`` land in that
+    final (open-ended) band.
+
+    Caller contract: only call this for ``horizon_years >= HORIZON_FLOOR_YEARS``
+    (the harness short-circuits below the floor before reaching here).
+    """
+    for band in HORIZON_GLIDE_PATH:
+        low = band["low"]
+        high = band["high"]
+        if horizon_years >= low and (high is None or horizon_years < high):
+            return {
+                "label": band["label"],
+                "growth_ceiling": band["growth_ceiling"],
+                "band": band["band"],
+                "horizon_years": horizon_years,
+            }
+    # Unreachable for horizon_years >= HORIZON_FLOOR_YEARS given the bands
+    # above start at 3, but fail-soft to the most conservative band.
+    first = HORIZON_GLIDE_PATH[0]
+    return {
+        "label": first["label"],
+        "growth_ceiling": first["growth_ceiling"],
+        "band": first["band"],
+        "horizon_years": horizon_years,
+    }
+
+
+def preservation_template(horizon_years: int) -> dict[str, float]:
+    """
+    Resolve the fixed capital-preservation allocation for a SHORT-circuit
+    horizon (``horizon_years < HORIZON_FLOOR_YEARS``).
+
+    ``horizon_years < 1`` -> the ``"<1y"`` template (pure T-bills);
+    ``1 <= horizon_years < 3`` -> the ``"1-3y"`` template (T-bills + short
+    Treasury + short TIPS).  Returns a fresh copy so callers can mutate
+    freely.
+    """
+    key = "<1y" if horizon_years < 1 else "1-3y"
+    return dict(PRESERVATION_TEMPLATES[key])
 
 
 def _refinement_improvements(
@@ -275,6 +536,167 @@ def _select_best_iteration(history: list[dict]) -> int | None:
     return best["iteration"]
 
 
+def _run_preservation(
+    horizon_years: int,
+    *,
+    price: bool,
+    risk: bool,
+    capital: float,
+) -> dict[str, Any]:
+    """
+    Build the SHORT-circuit (capital-preservation) result for a sub-floor
+    horizon (``horizon_years < HORIZON_FLOOR_YEARS``).
+
+    NO LLM agents run here — not the Planner, Generator, Evaluator, Refiner,
+    or Advisor.  We hand back the deterministic preservation template plus a
+    redirect message, then run the two NO-LLM steps (pricing & risk profile)
+    on the template's allocations so the user still gets a feasibility check
+    and a downside picture.  The result dict mirrors the optimized-mode
+    schema so every downstream reader (report, server, viz) can consume it
+    uniformly: stubs / skipped blocks fill the LLM-only slots.
+    """
+    allocations = preservation_template(horizon_years)
+    band = "<1y" if horizon_years < 1 else "1-3y"
+    redirect = (
+        f"Horizon of {horizon_years} year(s) is below the {HORIZON_FLOOR_YEARS}-year "
+        f"floor for return optimisation. At this horizon, capital preservation "
+        f"dominates: there is not enough time to recover from a drawdown, so the "
+        f"optimizer is short-circuited and a fixed high-grade cash / short-bond "
+        f"template is returned instead. To have a portfolio optimised for return, "
+        f"use a horizon of at least {HORIZON_FLOOR_YEARS} years."
+    )
+    descriptions = {
+        "SGOV": "iShares 0-3 Month Treasury ETF — T-bills / cash equivalent",
+        "SHY":  "iShares 1-3 Year Treasury ETF — short-duration US government bonds",
+        "VTIP": "Vanguard Short-Term TIPS ETF — short inflation-protected Treasuries",
+    }
+    descriptions = {t: descriptions.get(t, "") for t in allocations}
+
+    print("\n" + "=" * 60)
+    print(f"PRESERVATION SHORT-CIRCUIT — horizon {horizon_years}y < "
+          f"{HORIZON_FLOOR_YEARS}y floor (no LLM agents run)")
+    print("=" * 60)
+    print(redirect + "\n")
+    for ticker, weight in allocations.items():
+        print(f"  {ticker:20s}  {weight:6.1%}")
+    print()
+
+    # final_proposal carries the template; expected_* are NULL — these are a
+    # deterministic template, not a modeled / optimised book, so any return /
+    # drawdown number would be fabricated.
+    final_proposal = PortfolioProposal(
+        allocations=allocations,
+        descriptions=descriptions,
+        expected_annual_return=None,
+        expected_max_drawdown=None,
+        methodology=(
+            "Deterministic capital-preservation template (no optimisation). "
+            "Selected by horizon band, not by the LLM pipeline."
+        ),
+        rationale=redirect,
+        raw_text="",
+    )
+    spec_stub = InvestmentSpec(
+        objective=(
+            f"Capital preservation over a {horizon_years}-year horizon "
+            f"(below the {HORIZON_FLOOR_YEARS}-year optimisation floor)."
+        ),
+        constraints="Preserve principal; no return optimisation at this horizon.",
+        asset_universe="High-grade Treasuries, short TIPS, T-bills / cash.",
+        risk_budget="Minimise drawdown; do not deploy growth-asset risk.",
+        evaluation_criteria="N/A — deterministic template, not LLM-evaluated.",
+        raw_text="",
+    )
+    final_evaluation_stub = EvaluationResult(
+        passed=True,
+        scores={},
+        average_score=0.0,
+        critique=(
+            "Not QA-evaluated: capital-preservation template returned "
+            "deterministically below the horizon floor."
+        ),
+        raw_text="",
+    )
+
+    # --- Pricing & risk are NO-LLM steps — run them on the template ---
+    pricing_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "capital": capital,
+        "total_invested": 0.0,
+        "leftover_cash": 0.0,
+        "max_abs_drift": 0.0,
+        "rows": [],
+        "failed_tickers": [],
+        "disclaimer": PRICING_DISCLAIMER,
+        "source": "yfinance",
+        "fetched_at": "",
+        "error": None,
+    }
+    if not price:
+        pricing_block["skipped_reason"] = "disabled via --no-prices / --test"
+    else:
+        pricing_result = run_pricing(allocations, capital)
+        pricing_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(pricing_result),
+        }
+
+    risk_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": RISK_DISCLAIMER,
+        "error": None,
+    }
+    if not risk:
+        risk_block["skipped_reason"] = "disabled via --no-risk / --test"
+    else:
+        risk_result = run_risk_profile(allocations, horizon_years=horizon_years)
+        risk_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(risk_result),
+        }
+
+    return {
+        "model": api.MODEL,
+        "max_iterations": MAX_ITERATIONS,
+        "pass_threshold": PASS_THRESHOLD,
+        "target_max_loss": TARGET_MAX_LOSS,
+        "mode": "preservation",
+        "horizon_years": horizon_years,
+        "horizon_posture": PRESERVATION_POSTURE,
+        "preservation_band": band,
+        "redirect_message": redirect,
+        "spec": asdict(spec_stub),
+        "final_proposal": asdict(final_proposal),
+        "final_evaluation": asdict(final_evaluation_stub),
+        "selected_iteration": None,
+        "selected_proposal": asdict(final_proposal),
+        "selected_evaluation": asdict(final_evaluation_stub),
+        "iteration_history": [],
+        "refinement": {
+            "performed": False,
+            "skipped_reason": "preservation short-circuit — no optimisation loop",
+            "promoted": False,
+            "refined_proposal": None,
+            "refined_evaluation": None,
+            "improvements": None,
+        },
+        "advisor": {
+            "performed": False,
+            "skipped_reason": "preservation short-circuit — no LLM agents run",
+            "suggestions": [],
+            "correlation_pairs": [],
+            "notes": "",
+            "raw_text": "",
+        },
+        "pricing": pricing_block,
+        "risk_profile": risk_block,
+    }
+
+
 def run_harness(
     user_goal: str,
     *,
@@ -283,6 +705,7 @@ def run_harness(
     price: bool = True,
     risk: bool = True,
     capital: float = DEFAULT_CAPITAL,
+    horizon_years: int = DEFAULT_HORIZON_YEARS,
 ) -> dict[str, Any]:
     """
     Main entry point.  Runs the full Planner → Generator ↔ Evaluator loop,
@@ -316,9 +739,35 @@ def run_harness(
          proxies for young ETFs) reporting median outcome / chance of
          ending down / unlucky tails over several holding horizons.  Also
          yfinance-backed and fail-soft.
+
+    HORIZON (Phase 2):
+      ``horizon_years`` is risk *capacity*.  Below ``HORIZON_FLOOR_YEARS``
+      the whole optimisation loop is short-circuited to a deterministic
+      capital-preservation template (mode="preservation", NO LLM agents).
+      At or above the floor (mode="optimized") the glide-path posture for
+      the horizon is computed deterministically, injected into the Planner
+      as a growth-asset ceiling, and enforced by the Evaluator's
+      deterministic ceiling check.  ``DEFAULT_HORIZON_YEARS`` (10) lands in
+      the topmost band and reproduces today's output.
     """
-    # --- Step 1: Plan ---
-    spec = run_planner(user_goal)
+    # --- Horizon gate: short-circuit below the floor (no LLM agents) ---
+    if horizon_years < HORIZON_FLOOR_YEARS:
+        return _run_preservation(
+            horizon_years, price=price, risk=risk, capital=capital,
+        )
+
+    # --- Optimized regime: derive the glide-path posture deterministically ---
+    posture = posture_for_horizon(horizon_years)
+    growth_ceiling = posture["growth_ceiling"]
+    print("\n" + "=" * 60)
+    print(
+        f"HORIZON {horizon_years}y → posture '{posture['label']}' "
+        f"(band {posture['band']}, growth ceiling {growth_ceiling:.0%})"
+    )
+    print("=" * 60)
+
+    # --- Step 1: Plan (horizon-aware via the injected INVESTOR PROFILE) ---
+    spec = run_planner(user_goal, horizon_years=horizon_years, posture=posture)
 
     history: list[dict] = []
     proposals: list[PortfolioProposal] = []
@@ -335,6 +784,7 @@ def run_harness(
         evaluation = run_evaluator(
             spec, proposal,
             pass_threshold=PASS_THRESHOLD, max_loss=TARGET_MAX_LOSS,
+            growth_ceiling=growth_ceiling,
         )
 
         proposals.append(proposal)
@@ -464,6 +914,7 @@ def run_harness(
         refined_evaluation = run_evaluator(
             spec, refined_proposal,
             pass_threshold=PASS_THRESHOLD, max_loss=TARGET_MAX_LOSS,
+            growth_ceiling=growth_ceiling,
         )
 
         print(f"\n--- Refinement result ---")
@@ -587,7 +1038,7 @@ def run_harness(
         risk_block["skipped_reason"] = "no allocations to model"
         print("\n(Risk-profile step skipped — no allocations.)\n")
     else:
-        risk_result = run_risk_profile(final_proposal.allocations)
+        risk_result = run_risk_profile(final_proposal.allocations, horizon_years=horizon_years)
         risk_block = {
             "performed": True,
             "skipped_reason": None,
@@ -599,6 +1050,9 @@ def run_harness(
         "max_iterations": MAX_ITERATIONS,
         "pass_threshold": PASS_THRESHOLD,
         "target_max_loss": TARGET_MAX_LOSS,
+        "mode": "optimized",
+        "horizon_years": horizon_years,
+        "horizon_posture": posture["label"],
         "spec": asdict(spec),
         "final_proposal": asdict(final_proposal),
         "final_evaluation": asdict(final_evaluation),
@@ -650,6 +1104,8 @@ if __name__ == "__main__":
               uv run python harness.py --no-risk
               uv run python harness.py --capital 250000
               uv run python harness.py --max-loss 0.10
+              uv run python harness.py --horizon-years 5
+              uv run python harness.py --horizon-years 2
         """),
     )
     parser.add_argument(
@@ -738,6 +1194,22 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--horizon-years",
+        type=int,
+        default=DEFAULT_HORIZON_YEARS,
+        metavar="N",
+        help=(
+            f"Investment horizon in whole years (default {DEFAULT_HORIZON_YEARS}). "
+            f"Horizon is risk CAPACITY and binds independently of --max-loss "
+            f"(risk tolerance) — the more conservative of the two wins. At or "
+            f"above the {HORIZON_FLOOR_YEARS}-year floor the glide-path posture "
+            f"caps growth-asset weight (3-5y→50%%, 5-10y→75%%, 10y+→90%%) and the "
+            f"full pipeline runs. Below the floor the optimizer is short-circuited "
+            f"to a deterministic capital-preservation template (no LLM agents). "
+            f"Must be >= 1."
+        ),
+    )
+    parser.add_argument(
         "--capital",
         type=float,
         default=DEFAULT_CAPITAL,
@@ -749,6 +1221,13 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+
+    # --horizon-years validates in both --test and normal modes (it changes
+    # the recommended portfolio, not just a model/iteration knob).  Reject
+    # < 1 with a clear error; the run_harness floor handles the < 3 case.
+    if args.horizon_years < 1:
+        parser.error("--horizon-years must be >= 1 (whole years)")
+    horizon_years = args.horizon_years
 
     # Apply --test first (it takes precedence), then individual overrides.
     refine = not args.no_refine
@@ -829,6 +1308,8 @@ if __name__ == "__main__":
         "investor (stocks, ETFs, bonds, options overlays, etc.)."
     )
 
+    print(f"[horizon] {horizon_years} year(s)")
+
     result = run_harness(
         goal,
         refine=refine,
@@ -836,6 +1317,7 @@ if __name__ == "__main__":
         price=price,
         risk=risk,
         capital=capital,
+        horizon_years=horizon_years,
     )
 
     # Dump full trace to a JSON file for inspection
@@ -848,18 +1330,31 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("FINAL PORTFOLIO")
     print("=" * 60)
-    sel = result.get("selected_iteration")
-    if sel is not None:
-        print(f"  Selected iteration : {sel} of {MAX_ITERATIONS} (best passing)")
+    mode = result.get("mode", "optimized")
+    print(f"  Mode               : {mode}")
+    print(
+        f"  Horizon            : {result.get('horizon_years')} year(s) "
+        f"— {result.get('horizon_posture')}"
+    )
+    if mode == "preservation":
+        print("  (Capital-preservation short-circuit — no optimisation loop ran.)")
     else:
-        print(f"  Selected iteration : last of {MAX_ITERATIONS} (no iteration passed)")
+        sel = result.get("selected_iteration")
+        if sel is not None:
+            print(f"  Selected iteration : {sel} of {MAX_ITERATIONS} (best passing)")
+        else:
+            print(f"  Selected iteration : last of {MAX_ITERATIONS} (no iteration passed)")
     print(f"  Target max loss    : {result['target_max_loss']:.1%}\n")
 
     if result["final_proposal"]:
         for ticker, weight in result["final_proposal"]["allocations"].items():
             print(f"  {ticker:20s}  {weight:6.1%}")
-        print(f"\n  Expected return    : {result['final_proposal']['expected_annual_return']:.1%}")
-        print(f"  Expected max loss  : {result['final_proposal']['expected_max_drawdown']:.1%}")
+        exp_ret = result["final_proposal"]["expected_annual_return"]
+        exp_dd = result["final_proposal"]["expected_max_drawdown"]
+        # Preservation mode leaves these NULL (a deterministic template, not
+        # a modeled book) — print "n/a" rather than crash on the format spec.
+        print(f"\n  Expected return    : {exp_ret:.1%}" if exp_ret is not None else "\n  Expected return    : n/a")
+        print(f"  Expected max loss  : {exp_dd:.1%}" if exp_dd is not None else "  Expected max loss  : n/a")
     print(f"\n  Passed QA          : {result['final_evaluation']['passed']}")
     print(f"  Final avg score    : {result['final_evaluation']['average_score']}")
 
