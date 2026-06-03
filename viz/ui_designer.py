@@ -205,12 +205,40 @@ SYSTEM_PROMPT = textwrap.dedent("""\
         "failed_tickers": [ticker, ...],
         "disclaimer": str,
         "fetched_at": str                 # ISO timestamp
+      },
+      "risk_profile": {                   # Monte-Carlo return distribution (no LLM)
+        "performed": bool,
+        "skipped_reason": str | null,     # set when skipped (e.g. --no-risk / --test)
+        "sample_start": str, "sample_end": str,   # historical window bootstrapped
+        "sample_years": float,
+        "includes_2008": bool,            # does the window span the 2008 crisis?
+        "limiting_ticker": str | null,    # holding that constrained the window start
+        "annualized_return": float,       # realized in the sample (geometric)
+        "annualized_vol": float,          # realized in the sample
+        "coverage_weight": float,         # fraction of the book actually modeled (0-1)
+        "proxy_substitutions": [          # young ETF -> long-history asset-class proxy
+          {"original": ticker, "proxy": ticker}, ...
+        ],
+        "dropped_tickers": [ticker, ...], # non-priceable legs (e.g. option overlays)
+        "horizons": [                     # one row per holding period
+          {"horizon_years": int,
+           "median": float,               # typical (50th-pct) total compounded return
+           "mean": float,
+           "prob_end_down": float,        # P(end underwater) at this horizon, 0-1
+           "bad_5th": float,              # 5th-pctile (1-in-20) total return
+           "severe_1st": float}, ...      # 1st-pctile (1-in-100) total return
+        ],
+        "n_sims": int, "block_days": int,
+        "disclaimer": str,
+        "error": str | null               # set if the profile could not run
       }
     }
 
     Some fields may be missing or null on any given run (e.g., refinement
-    may be skipped via --no-refine).  Handle absence gracefully — hide
-    the corresponding section rather than rendering empty placeholders.
+    may be skipped via --no-refine; risk_profile may be skipped via
+    --no-risk, or carry an `error` when offline).  Handle absence
+    gracefully — hide the corresponding section rather than rendering
+    empty placeholders.
 
     Now generate the dashboard.
 """)
