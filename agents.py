@@ -498,6 +498,9 @@ def run_evaluator(
         evaluator_system(max_loss), user_msg,
         tools=_BACKTEST_TOOLS,
         tool_handlers=_BACKTEST_HANDLERS,
+        # Long stress narration + JSON scores/critique (now incl. the growth
+        # ceiling) truncate at the 4096 default; give it Refiner-level room.
+        max_tokens=api.EVALUATOR_MAX_TOKENS,
         # 3 standard stress windows + headroom for sub-scenarios + final
         # text emission; well clear of the default 8 but explicit here so
         # the cap is documented at the call site.

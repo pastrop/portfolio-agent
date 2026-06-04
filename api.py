@@ -59,6 +59,13 @@ REFINER_MAX_TOKENS = 8192
 # findings.  Web search also induces some narration overhead before the
 # final JSON.  4096 truncates regularly; bump to match Refiner's headroom.
 PLANNER_MAX_TOKENS = 8192
+# The Evaluator runs multi-round `compute_backtest` tool calls and narrates
+# a long natural-language stress analysis BEFORE emitting its JSON scores +
+# critique — and the horizon glide path added a sixth (growth-ceiling)
+# criterion.  At 4096 the prose eats the budget and the JSON never arrives
+# (stop_reason=max_tokens), so `_parse_json_response` falls back to an empty
+# dict and the whole evaluation is lost.  Match the Planner/Refiner headroom.
+EVALUATOR_MAX_TOKENS = 8192
 
 
 # ---------------------------------------------------------------------------
