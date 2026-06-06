@@ -67,6 +67,21 @@ class RunRequest(BaseModel):
             "is used."
         ),
     )
+    horizon_years: int = Field(
+        10,
+        ge=1,
+        description=(
+            "Investment horizon in whole years. Mirrors `--horizon-years` "
+            "on the CLI (default DEFAULT_HORIZON_YEARS=10, so omitting it "
+            "reproduces today's output). Horizon = risk CAPACITY; it binds "
+            "independently of max_loss and the MORE CONSERVATIVE wins. "
+            ">=3y runs the full optimizer with a glide-path growth ceiling "
+            "injected into the Planner; <3y short-circuits to a "
+            "deterministic capital-preservation template (NO LLM agents "
+            "run). Unlike max_loss/iterations this is a plain run_harness "
+            "argument, not a patched global."
+        ),
+    )
     refine: bool = Field(True, description="Run the post-selection Refiner pass.")
     advise: bool = Field(True, description="Run the Advisor passes (intra-loop + final).")
     price: bool = Field(True, description="Run the yfinance pricing / lot-size check.")
@@ -95,13 +110,31 @@ class RunCreated(BaseModel):
 
 
 class ResultSummary(BaseModel):
-    """Compact summary of a finished run.  Full trace is in the JSON artifact."""
+    """
+    Compact summary of a finished run.  Full trace is in the JSON artifact.
 
+    Phase 2: the summary is regime-aware.  In ``mode == "preservation"``
+    (horizon_years < 3) NO LLM agents run, so the optimizer-centric fields
+    (``selected_iteration``, ``final_average_score``, ``final_expected_*``)
+    are naturally null/zero and ``passed_qa`` is ``None`` rather than a
+    misleading ``true``/``false`` — the deterministic template was never
+    put through the Generator↔Evaluator QA loop.  ``annualized_return`` is
+    surfaced from the (no-LLM) Monte-Carlo risk profile so preservation
+    runs still report a meaningful expected return instead of a flat zero.
+    """
+
+    mode: Literal["optimized", "preservation"]
     selected_iteration: Optional[int]
     final_average_score: float
     final_expected_return: float
     final_expected_max_drawdown: float
-    passed_qa: bool
+    # Realized geometric annualized return from the Monte-Carlo risk
+    # profile (``risk_profile.annualized_return``).  None when the risk
+    # pass was skipped (e.g. test mode / risk=false).
+    annualized_return: Optional[float]
+    # None in preservation mode: the template never went through QA.  A
+    # bool only when an actual Evaluator pass/fail was produced.
+    passed_qa: Optional[bool]
 
 
 class JobView(BaseModel):

@@ -120,6 +120,13 @@ SYSTEM_PROMPT = textwrap.dedent("""\
       "max_iterations": int,              # e.g. 3
       "pass_threshold": int,              # e.g. 7
       "target_max_loss": float,           # e.g. 0.05  (5% loss cap)
+      "mode": str,                        # "optimized" | "preservation"
+                                          #   (missing ⇒ treat as "optimized")
+      "horizon_years": int,               # investment horizon, e.g. 10
+      "horizon_posture": str,             # derived risk-posture label, e.g.
+                                          #   "Growth" / "Balanced growth" /
+                                          #   "Conservative balanced" /
+                                          #   "Capital preservation"
       "spec": {                           # output of the Planner
         "objective": str | dict,
         "constraints": str | dict,
@@ -239,6 +246,15 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     --no-risk, or carry an `error` when offline).  Handle absence
     gracefully — hide the corresponding section rather than rendering
     empty placeholders.
+
+    When `mode == "preservation"` (short horizon — the optimizer was
+    deliberately bypassed), tell the PRESERVATION STORY: the deterministic
+    capital-preservation template (final_proposal.allocations), the
+    redirect_message explaining why the horizon was redirected, plus the
+    pricing and risk_profile sections.  Do NOT render empty QA / iteration
+    sections in this mode — iteration_history is [], refinement/advisor are
+    skipped, and final_proposal.expected_annual_return /
+    expected_max_drawdown are null (guard any formatting on them).
 
     Now generate the dashboard.
 """)
