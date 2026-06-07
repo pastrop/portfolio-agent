@@ -5,13 +5,13 @@ A multi-agent harness inspired by Anthropic's "Harness design for
 long-running application development" blog post, applied to financial
 portfolio optimisation.
 
-Composition (Planner → (Generator ↔ Evaluator + intra-Advisor) × N →
-Selector → Refiner → Re-evaluate → Final Advisor → Pricing) lives in
-this file.  The five LLM agents themselves are in ``agents.py``; the
-Anthropic client wrapper and JSON parser are in ``api.py``; the
-dataclasses passed between agents are in ``models.py``; the markdown
-report writer is in ``report.py``; the yfinance-backed lot-size step
-is in ``pricing.py``.
+Composition (Planner → (Generator ↔ Evaluator) × N → Selector → Refiner
+→ Re-evaluate → Pricing → Risk → Correlation) lives in this file.  The
+four LLM agents themselves are in ``agents.py``; the Anthropic client
+wrapper and JSON parser are in ``api.py``; the dataclasses passed between
+agents are in ``models.py``; the markdown report writer is in
+``report.py``; the yfinance-backed lot-size step is in ``pricing.py``;
+the no-LLM pairwise-correlation snapshot is in ``correlation.py``.
 
 This is a *concept exploration* — most data is model-recalled, not
 computed from market feeds (except for the Pricing step's yfinance
@@ -27,18 +27,17 @@ from typing import Any
 
 import api
 from agents import (
-    run_advisor,
     run_evaluator,
     run_generator,
     run_planner,
     run_refiner,
 )
 from models import (
-    AdvisorOutput,
     EvaluationResult,
     InvestmentSpec,
     PortfolioProposal,
 )
+from correlation import CORRELATION_DISCLAIMER, run_correlation
 from pricing import DEFAULT_CAPITAL, PRICING_DISCLAIMER, run_pricing
 from report import write_markdown_report
 from risk import RISK_DISCLAIMER, RISK_PROXY_MAP, run_risk_profile
@@ -47,9 +46,9 @@ from risk import RISK_DISCLAIMER, RISK_PROXY_MAP, run_risk_profile
 # Orchestrator-only policy constants
 # ---------------------------------------------------------------------------
 # (Model / token / retry config lives in api.py; per-agent model selection
-# is api.MODEL / api.PLANNER_MODEL / api.ADVISOR_MODEL.  The CLI block at
-# the bottom of this file patches those module-level globals when --test
-# or --model X is provided.)
+# is api.MODEL / api.PLANNER_MODEL.  The CLI block at the bottom of this
+# file patches those module-level globals when --test or --model X is
+# provided.)
 MAX_ITERATIONS = 3          # generator ↔ evaluator rounds
 PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
 TARGET_MAX_LOSS = 0.05      # default loss budget we want expected_max_drawdown to land on (overridable via --max-loss)
@@ -59,12 +58,6 @@ TARGET_MAX_LOSS = 0.05      # default loss budget we want expected_max_drawdown 
 # UNDER_UTILISATION_BAND = UNDER_UTILISATION_RATIO * TARGET_MAX_LOSS.
 UNDER_UTILISATION_RATIO = 0.8
 UNDER_UTILISATION_BAND = UNDER_UTILISATION_RATIO * TARGET_MAX_LOSS
-# Threshold for which Advisor-flagged correlation pairs count as
-# actionable feedback for the next Generator iteration.  The Advisor
-# surfaces pairs at |ρ| ≥ 0.5 for the report, but for prompt feedback
-# we only want the egregious overlaps (≥ 0.7) so the next prompt
-# isn't cluttered with marginal pairs.
-ADVISOR_FEEDBACK_RHO_THRESHOLD = 0.7
 
 # ---------------------------------------------------------------------------
 # Horizon policy (Phase 2) — horizon = risk CAPACITY
@@ -382,70 +375,14 @@ def _refinement_improvements(
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR — the harness loop
 # ---------------------------------------------------------------------------
-def _format_advisor_feedback(advisor_output: AdvisorOutput | None) -> str:
-    """
-    Format the Advisor's correlation findings as a concrete, actionable
-    block for the next Generator iteration's prompt.  Only pairs whose
-    absolute correlation is ≥ ``ADVISOR_FEEDBACK_RHO_THRESHOLD`` (default
-    0.7) are surfaced — below that we don't want to clutter the prompt
-    with marginal overlaps.
-
-    Returns "" when the Advisor is missing, found nothing actionable,
-    or wasn't run.
-    """
-    if advisor_output is None:
-        return ""
-    pairs = []
-    for p in (advisor_output.correlation_pairs or []):
-        try:
-            rho = float(p.get("rho", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if abs(rho) >= ADVISOR_FEEDBACK_RHO_THRESHOLD:
-            pairs.append((p.get("a", ""), p.get("b", ""), rho))
-    suggestions = advisor_output.suggestions or []
-    if not pairs and not suggestions:
-        return ""
-
-    lines: list[str] = [
-        "ADVISOR FINDINGS — OVERLAPPING HOLDINGS IN YOUR PREVIOUS PORTFOLIO:",
-        "",
-        (
-            f"The previous portfolio contains highly correlated holdings "
-            f"(|ρ| ≥ {ADVISOR_FEEDBACK_RHO_THRESHOLD:.2f}). Each pair "
-            f"represents redundant exposure — collapse each pair into "
-            f"ONE ticker in your next iteration."
-        ),
-        "",
-    ]
-    if pairs:
-        lines.append("Correlated pairs to consolidate:")
-        for a, b, rho in sorted(pairs, key=lambda x: -abs(x[2])):
-            lines.append(f"  • {a} ↔ {b}  (ρ ≈ {rho:+.2f})")
-        lines.append("")
-    if suggestions:
-        lines.append("Specific consolidation suggestions:")
-        for s in suggestions:
-            merge_from = " + ".join(s.get("merge_from") or []) or "(unspecified)"
-            merge_into = s.get("merge_into") or "(unspecified)"
-            tradeoff = s.get("tradeoff") or ""
-            line = f"  • Replace {merge_from} → {merge_into}"
-            if tradeoff:
-                line += f"  (tradeoff: {tradeoff})"
-            lines.append(line)
-        lines.append("")
-    return "\n".join(lines)
-
-
 def _build_feedback(
     evaluation: EvaluationResult,
     proposal: PortfolioProposal,
-    advisor_output: AdvisorOutput | None = None,
 ) -> str:
     """
     Produce the next round's feedback string based on the current evaluation.
 
-    Three regimes (selects the BASE feedback text):
+    Four regimes (selects the feedback text):
       • Failed QA              → pass the critique through unchanged (today's behaviour).
       • Passed but over target → tell the generator to bring drawdown down to
                                  ~TARGET_MAX_LOSS without sacrificing scores.
@@ -455,14 +392,6 @@ def _build_feedback(
                                  under) TARGET_MAX_LOSS.
       • Passed and near target → still ask for a refinement attempt — the
                                  selector will keep the best across iterations.
-
-    If ``advisor_output`` is provided, its concrete correlation-pair
-    findings (≥ ``ADVISOR_FEEDBACK_RHO_THRESHOLD``) are prepended to the
-    base feedback.  This converts the Advisor from a one-shot report
-    decoration into a real signal in the generator ↔ evaluator loop —
-    the Generator gets actual overlapping pairs to fix in the next
-    iteration, instead of a vague "avoid correlation" rule it cannot
-    apply (LLMs can't reliably estimate ρ from memory).
     """
     if not evaluation.passed:
         base = evaluation.critique
@@ -502,9 +431,6 @@ def _build_feedback(
                 f"{evaluation.critique}"
             )
 
-    advisor_section = _format_advisor_feedback(advisor_output)
-    if advisor_section:
-        return advisor_section + "\n" + base
     return base
 
 
@@ -541,19 +467,21 @@ def _run_preservation(
     *,
     price: bool,
     risk: bool,
+    correlation: bool,
     capital: float,
 ) -> dict[str, Any]:
     """
     Build the SHORT-circuit (capital-preservation) result for a sub-floor
     horizon (``horizon_years < HORIZON_FLOOR_YEARS``).
 
-    NO LLM agents run here — not the Planner, Generator, Evaluator, Refiner,
-    or Advisor.  We hand back the deterministic preservation template plus a
-    redirect message, then run the two NO-LLM steps (pricing & risk profile)
-    on the template's allocations so the user still gets a feasibility check
-    and a downside picture.  The result dict mirrors the optimized-mode
-    schema so every downstream reader (report, server, viz) can consume it
-    uniformly: stubs / skipped blocks fill the LLM-only slots.
+    NO LLM agents run here — not the Planner, Generator, Evaluator, or
+    Refiner.  We hand back the deterministic preservation template plus a
+    redirect message, then run the NO-LLM steps (pricing, risk profile, and
+    correlation snapshot) on the template's allocations so the user still
+    gets a feasibility check, a downside picture, and a correlation view.
+    The result dict mirrors the optimized-mode schema so every downstream
+    reader (report, server, viz) can consume it uniformly: stubs / skipped
+    blocks fill the LLM-only slots.
     """
     allocations = preservation_template(horizon_years)
     band = "<1y" if horizon_years < 1 else "1-3y"
@@ -659,6 +587,22 @@ def _run_preservation(
             **asdict(risk_result),
         }
 
+    correlation_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": CORRELATION_DISCLAIMER,
+        "error": None,
+    }
+    if not correlation:
+        correlation_block["skipped_reason"] = "disabled via --no-correlation / --test"
+    else:
+        correlation_result = run_correlation(allocations)
+        correlation_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(correlation_result),
+        }
+
     return {
         "model": api.MODEL,
         "max_iterations": MAX_ITERATIONS,
@@ -684,16 +628,9 @@ def _run_preservation(
             "refined_evaluation": None,
             "improvements": None,
         },
-        "advisor": {
-            "performed": False,
-            "skipped_reason": "preservation short-circuit — no LLM agents run",
-            "suggestions": [],
-            "correlation_pairs": [],
-            "notes": "",
-            "raw_text": "",
-        },
         "pricing": pricing_block,
         "risk_profile": risk_block,
+        "correlation": correlation_block,
     }
 
 
@@ -701,44 +638,43 @@ def run_harness(
     user_goal: str,
     *,
     refine: bool = True,
-    advise: bool = True,
     price: bool = True,
     risk: bool = True,
+    correlation: bool = True,
     capital: float = DEFAULT_CAPITAL,
     horizon_years: int = DEFAULT_HORIZON_YEARS,
 ) -> dict[str, Any]:
     """
     Main entry point.  Runs the full Planner → Generator ↔ Evaluator loop,
-    then (by default) a post-selection REFINER pass, an ADVISOR pass, and
-    a PRICING / lot-size feasibility pass.
+    then (by default) a post-selection REFINER pass, a PRICING / lot-size
+    feasibility pass, a Monte-Carlo RISK profile, and a no-LLM CORRELATION
+    snapshot.
 
     Flow:
       1. Planner expands the goal into a full investment spec.
       2. MAX_ITERATIONS rounds of Generator ↔ Evaluator.  Always runs
          all rounds; never breaks early.
       3. Select the best PASSING iteration whose expected_max_drawdown
-         is closest to TARGET_MAX_LOSS.  Falls back to the last iteration
+         is closest to TARGET_MAX_LOSS.  Falls back to the first iteration
          if nothing passed.
       4. If `refine=True`, run a single Refiner pass on the selected
          portfolio: Refiner addresses every critique point, then the
          Evaluator re-scores.  If the refined version passes QA, it is
          PROMOTED to `final_proposal`; otherwise the selected one stays
          as the final answer.
-      5. If `advise=True`, run a single ADVISOR pass on the final
-         portfolio.  The Advisor is read-only — it never modifies the
-         portfolio.  It returns a pairwise correlation snapshot and a
-         list of structured "merge X+Y into Z" suggestions with explicit
-         trade-offs, so the human reader can decide whether to apply any.
-      6. If `price=True`, fetch the latest price for each ticker in the
+      5. If `price=True`, fetch the latest price for each ticker in the
          final portfolio via yfinance and compute a whole-share lot-size
          feasibility check against `capital` USD.  Per-ticker failures
          (unknown ticker, network blip, model-invented pseudo-ticker) are
          recorded gracefully and never abort the pipeline.
-      7. If `risk=True`, build a Monte-Carlo return-distribution profile
+      6. If `risk=True`, build a Monte-Carlo return-distribution profile
          (block-bootstrap of historical returns, long-history asset-class
          proxies for young ETFs) reporting median outcome / chance of
          ending down / unlucky tails over several holding horizons.  Also
          yfinance-backed and fail-soft.
+      7. If `correlation=True`, compute a pairwise daily-return correlation
+         snapshot (yfinance, no LLM) on the final portfolio, flagging
+         highly redundant holdings (|ρ| >= 0.85).  Fail-soft.
 
     HORIZON (Phase 2):
       ``horizon_years`` is risk *capacity*.  Below ``HORIZON_FLOOR_YEARS``
@@ -753,7 +689,8 @@ def run_harness(
     # --- Horizon gate: short-circuit below the floor (no LLM agents) ---
     if horizon_years < HORIZON_FLOOR_YEARS:
         return _run_preservation(
-            horizon_years, price=price, risk=risk, capital=capital,
+            horizon_years,
+            price=price, risk=risk, correlation=correlation, capital=capital,
         )
 
     # --- Optimized regime: derive the glide-path posture deterministically ---
@@ -790,29 +727,6 @@ def run_harness(
         proposals.append(proposal)
         evaluations.append(evaluation)
 
-        # --- Step 3a: Intra-iteration Advisor (feedback signal) ---
-        # Run the Advisor on this iteration's portfolio so the next
-        # round's Generator prompt gets CONCRETE correlation pairs to
-        # collapse, rather than a vague "avoid overlap" rule that the
-        # LLM cannot apply.  Skip on the last iteration (no next round),
-        # when advise is disabled, or when the proposal produced no
-        # allocations.  The final Advisor pass (Step 6) still runs for
-        # the report and may see a different portfolio.
-        # None ⇒ didn't run; int (including 0) ⇒ ran and fed N pairs forward
-        intra_advisor: AdvisorOutput | None = None
-        intra_pairs_count: int | None = None
-        if (
-            advise
-            and i < MAX_ITERATIONS
-            and proposal.allocations
-        ):
-            intra_advisor = run_advisor(proposal)
-            intra_pairs_count = sum(
-                1 for p in (intra_advisor.correlation_pairs or [])
-                if abs(float(p.get("rho", 0) or 0))
-                   >= ADVISOR_FEEDBACK_RHO_THRESHOLD
-            )
-
         history.append({
             "iteration": i,
             "allocations": proposal.allocations,
@@ -823,7 +737,6 @@ def run_harness(
             "average_score": evaluation.average_score,
             "passed": evaluation.passed,
             "critique_snippet": evaluation.critique[:300],
-            "intra_advisor_pairs_count": intra_pairs_count,
             "selected": False,
         })
 
@@ -833,12 +746,6 @@ def run_harness(
         print(f"  Passed              : {evaluation.passed}")
         print(f"  Expected max loss   : {proposal.expected_max_drawdown:.2%}")
         print(f"  Target max loss     : {TARGET_MAX_LOSS:.0%}")
-        if intra_advisor is not None:
-            print(
-                f"  Advisor (pre-feedback) flagged {intra_pairs_count} "
-                f"pair(s) at |ρ| ≥ {ADVISOR_FEEDBACK_RHO_THRESHOLD:.2f} "
-                f"— feeding into iteration {i + 1}"
-            )
 
         if i == MAX_ITERATIONS:
             # No need to compute feedback after the last round.
@@ -855,9 +762,7 @@ def run_harness(
         else:
             print("❌  Failed QA — feeding critique back to generator.\n")
 
-        feedback = _build_feedback(
-            evaluation, proposal, advisor_output=intra_advisor,
-        )
+        feedback = _build_feedback(evaluation, proposal)
 
     # --- Step 4: Select the best passing iteration ---
     selected_idx = _select_best_iteration(history)
@@ -963,39 +868,7 @@ def run_harness(
                 f"Keeping selected iteration {selected_idx} as final.\n"
             )
 
-    # --- Step 6: Advisor (read-only, advisory only) ---
-    advisor_block: dict[str, Any] = {
-        "performed": False,
-        "skipped_reason": None,
-        "suggestions": [],
-        "correlation_pairs": [],
-        "notes": "",
-        "raw_text": "",
-    }
-    if not advise:
-        advisor_block["skipped_reason"] = "disabled via --no-advisor / --test"
-        print("\n(Advisor step skipped.)\n")
-    elif not final_proposal.allocations:
-        advisor_block["skipped_reason"] = "no allocations to advise on"
-        print("\n(Advisor step skipped — no allocations.)\n")
-    else:
-        advisor_output = run_advisor(final_proposal)
-        advisor_block.update({
-            "performed": True,
-            "suggestions": advisor_output.suggestions,
-            "correlation_pairs": advisor_output.correlation_pairs,
-            "notes": advisor_output.notes,
-            "raw_text": advisor_output.raw_text,
-        })
-        n_pairs = len(advisor_output.correlation_pairs)
-        n_sugg = len(advisor_output.suggestions)
-        print(
-            f"\n💡  Advisor returned {n_pairs} correlated pair(s) and "
-            f"{n_sugg} consolidation suggestion(s).  The portfolio was "
-            f"NOT modified — see the report for details.\n"
-        )
-
-    # --- Step 7: Pricing & lot-size feasibility (yfinance) ---
+    # --- Step 6: Pricing & lot-size feasibility (yfinance) ---
     pricing_block: dict[str, Any] = {
         "performed": False,
         "skipped_reason": None,
@@ -1024,7 +897,7 @@ def run_harness(
             **asdict(pricing_result),
         }
 
-    # --- Step 8: Return-distribution risk profile (yfinance + Monte-Carlo) ---
+    # --- Step 7: Return-distribution risk profile (yfinance + Monte-Carlo) ---
     risk_block: dict[str, Any] = {
         "performed": False,
         "skipped_reason": None,
@@ -1045,6 +918,27 @@ def run_harness(
             **asdict(risk_result),
         }
 
+    # --- Step 8: Pairwise-correlation snapshot (yfinance, no LLM) ---
+    correlation_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": CORRELATION_DISCLAIMER,
+        "error": None,
+    }
+    if not correlation:
+        correlation_block["skipped_reason"] = "disabled via --no-correlation / --test"
+        print("\n(Correlation step skipped.)\n")
+    elif not final_proposal.allocations:
+        correlation_block["skipped_reason"] = "no allocations to correlate"
+        print("\n(Correlation step skipped — no allocations.)\n")
+    else:
+        correlation_result = run_correlation(final_proposal.allocations)
+        correlation_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(correlation_result),
+        }
+
     return {
         "model": api.MODEL,
         "max_iterations": MAX_ITERATIONS,
@@ -1061,9 +955,9 @@ def run_harness(
         "selected_evaluation": asdict(selected_evaluation),
         "iteration_history": history,
         "refinement": refinement_block,
-        "advisor": advisor_block,
         "pricing": pricing_block,
         "risk_profile": risk_block,
+        "correlation": correlation_block,
     }
 
 
@@ -1099,9 +993,9 @@ if __name__ == "__main__":
               uv run python harness.py --model sonnet
               uv run python harness.py --model haiku --iterations 1
               uv run python harness.py --no-refine
-              uv run python harness.py --no-advisor
               uv run python harness.py --no-prices
               uv run python harness.py --no-risk
+              uv run python harness.py --no-correlation
               uv run python harness.py --capital 250000
               uv run python harness.py --max-loss 0.10
               uv run python harness.py --horizon-years 5
@@ -1145,14 +1039,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--no-advisor",
+        "--no-correlation",
         action="store_true",
         help=(
-            "Skip the post-selection Advisor pass. By default, after the "
-            "final portfolio is determined, an Advisor agent produces a "
-            "pairwise correlation snapshot and concrete consolidation "
-            "suggestions (advisory only — never modifies the portfolio). "
-            "--test implies --no-advisor."
+            "Skip the post-selection Correlation snapshot. By default, after "
+            "the final portfolio is determined, a no-LLM step computes the "
+            "pairwise daily-return correlations of the holdings from Yahoo "
+            "Finance history and flags highly redundant pairs (|ρ| >= 0.85). "
+            "yfinance-backed and fail-soft. --test implies --no-correlation."
         ),
     )
     parser.add_argument(
@@ -1231,9 +1125,9 @@ if __name__ == "__main__":
 
     # Apply --test first (it takes precedence), then individual overrides.
     refine = not args.no_refine
-    advise = not args.no_advisor
     price = not args.no_prices
     risk = not args.no_risk
+    correlation = not args.no_correlation
     capital = args.capital
     if args.test:
         # --test forces ALL agents to haiku (and disables everything else).
@@ -1241,15 +1135,15 @@ if __name__ == "__main__":
         # call_claude picks them up on the next call.
         api.MODEL = _MODEL_ALIASES["haiku"]
         api.PLANNER_MODEL = _MODEL_ALIASES["haiku"]
-        api.ADVISOR_MODEL = _MODEL_ALIASES["haiku"]
         MAX_ITERATIONS = 1
-        refine = False   # --test always implies --no-refine
-        advise = False   # --test always implies --no-advisor
-        price = False    # --test always implies --no-prices
-        risk = False     # --test always implies --no-risk
+        refine = False        # --test always implies --no-refine
+        price = False         # --test always implies --no-prices
+        risk = False          # --test always implies --no-risk
+        correlation = False   # --test always implies --no-correlation
         print(
             f"[TEST MODE] model={api.MODEL}  iterations={MAX_ITERATIONS}  "
-            f"refine={refine}  advise={advise}  price={price}  risk={risk}"
+            f"refine={refine}  price={price}  risk={risk}  "
+            f"correlation={correlation}"
         )
     else:
         if args.model:
@@ -1259,14 +1153,13 @@ if __name__ == "__main__":
             resolved = _MODEL_ALIASES.get(args.model, args.model)
             api.MODEL = resolved
             api.PLANNER_MODEL = resolved
-            api.ADVISOR_MODEL = resolved
             print(f"[model override — all agents] {api.MODEL}")
         else:
             # No override — show the per-agent assignments so the user
             # knows the pipeline isn't uniform.
             print(
                 f"[per-agent models] generator/evaluator/refiner={api.MODEL}  "
-                f"planner={api.PLANNER_MODEL}  advisor={api.ADVISOR_MODEL}"
+                f"planner={api.PLANNER_MODEL}"
             )
         if args.iterations is not None:
             if args.iterations < 1:
@@ -1277,14 +1170,14 @@ if __name__ == "__main__":
             parser.error("--capital must be > 0")
         if not refine:
             print("[refinement disabled]")
-        if not advise:
-            print("[advisor disabled]")
         if not price:
             print("[pricing disabled]")
         else:
             print(f"[pricing enabled  capital=${capital:,.0f}]")
         if not risk:
             print("[risk profile disabled]")
+        if not correlation:
+            print("[correlation disabled]")
 
     # --max-loss applies in both --test and normal modes (orthogonal to
     # model / iteration overrides).  Patching TARGET_MAX_LOSS here means
@@ -1313,9 +1206,9 @@ if __name__ == "__main__":
     result = run_harness(
         goal,
         refine=refine,
-        advise=advise,
         price=price,
         risk=risk,
+        correlation=correlation,
         capital=capital,
         horizon_years=horizon_years,
     )

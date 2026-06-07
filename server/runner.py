@@ -4,7 +4,7 @@ Synchronous wrapper around ``harness.run_harness`` for the server.
 Responsibilities:
 
   * Snapshot the project's mutable module globals (``api.MODEL`` /
-    ``api.PLANNER_MODEL`` / ``api.ADVISOR_MODEL`` / ``harness.MAX_ITERATIONS``),
+    ``api.PLANNER_MODEL`` / ``harness.MAX_ITERATIONS``),
     patch them per the request, then restore on exit.  Mirrors the
     behaviour of the CLI's ``__main__`` block in ``harness.py`` and means
     out-of-band CLI runs in a separate process see no interference.
@@ -212,7 +212,6 @@ def execute_run_sync(
     # --- Snapshot mutable project globals so we can restore in finally ---
     orig_model = api.MODEL
     orig_planner = api.PLANNER_MODEL
-    orig_advisor = api.ADVISOR_MODEL
     orig_max_iter = harness.MAX_ITERATIONS
     orig_max_loss = harness.TARGET_MAX_LOSS
     orig_under_band = harness.UNDER_UTILISATION_BAND
@@ -220,15 +219,15 @@ def execute_run_sync(
     # --- Resolve effective flags (test mode overrides explicit flags) ---
     if req.test:
         refine = False
-        advise = False
         price = False
         risk = False
+        correlation = False
         iterations: Optional[int] = 1
     else:
         refine = req.refine
-        advise = req.advise
         price = req.price
         risk = req.risk
+        correlation = req.correlation
         iterations = req.iterations
 
     # --- Apply patches ---
@@ -236,7 +235,6 @@ def execute_run_sync(
     if override_model is not None:
         api.MODEL = override_model
         api.PLANNER_MODEL = override_model
-        api.ADVISOR_MODEL = override_model
     if iterations is not None:
         harness.MAX_ITERATIONS = iterations
     # --max-loss equivalent: patch TARGET_MAX_LOSS and recompute the
@@ -270,7 +268,8 @@ def execute_run_sync(
                 f"(model_override={override_model or '<per-agent mix>'}, "
                 f"iterations={iterations if iterations is not None else harness.MAX_ITERATIONS}, "
                 f"horizon={req.horizon_years}y, "
-                f"refine={refine}, advise={advise}, price={price}, risk={risk})\n"
+                f"refine={refine}, price={price}, risk={risk}, "
+                f"correlation={correlation})\n"
             )
             _REAL_STDOUT.flush()
 
@@ -279,9 +278,9 @@ def execute_run_sync(
                     result = harness.run_harness(
                         req.goal,
                         refine=refine,
-                        advise=advise,
                         price=price,
                         risk=risk,
+                        correlation=correlation,
                         capital=req.capital,
                         # Plain function argument — NOT a patched/snapshotted
                         # global like MODEL / MAX_ITERATIONS / TARGET_MAX_LOSS.
@@ -329,7 +328,6 @@ def execute_run_sync(
         # --- Restore globals ---
         api.MODEL = orig_model
         api.PLANNER_MODEL = orig_planner
-        api.ADVISOR_MODEL = orig_advisor
         harness.MAX_ITERATIONS = orig_max_iter
         harness.TARGET_MAX_LOSS = orig_max_loss
         harness.UNDER_UTILISATION_BAND = orig_under_band

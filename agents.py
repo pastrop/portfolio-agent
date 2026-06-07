@@ -3,19 +3,19 @@ The five LLM agents for the Portfolio Optimization Harness.
 
 Each agent is a (SYSTEM prompt + ``run_*`` function) pair.  The
 orchestrator in ``harness.py`` composes them in the
-Planner → (Generator ↔ Evaluator) × N → Refiner → Re-evaluate →
-Advisor sequence; the Advisor is also run between iterations to feed
-its correlation findings back into the next round's Generator prompt.
+Planner → (Generator ↔ Evaluator) × N → Refiner → Re-evaluate
+sequence.  Pairwise-correlation reporting (formerly an LLM "Advisor"
+agent) is now a deterministic, no-LLM step in ``correlation.py``.
 
 Dependencies:
 * ``models`` for the dataclass return types (InvestmentSpec,
-  PortfolioProposal, EvaluationResult, AdvisorOutput)
+  PortfolioProposal, EvaluationResult)
 * ``api`` for the Anthropic client wrapper (``call_claude``) and the
   fail-soft JSON parser (``_parse_json_response``).  Per-agent model
-  selection (``api.PLANNER_MODEL``, ``api.ADVISOR_MODEL``) and the
-  Refiner's larger token budget (``api.REFINER_MAX_TOKENS``) are read
-  at call time via ``import api``, so CLI patches in ``harness.py``
-  take effect without any extra wiring.
+  selection (``api.PLANNER_MODEL``) and the Refiner's larger token
+  budget (``api.REFINER_MAX_TOKENS``) are read at call time via
+  ``import api``, so CLI patches in ``harness.py`` take effect without
+  any extra wiring.
 
 Orchestrator policy constants (``PASS_THRESHOLD``, ``MAX_ITERATIONS``)
 that affect agent behavior are accepted as keyword arguments rather
@@ -29,7 +29,6 @@ import textwrap
 import api
 from api import call_claude, _parse_json_response
 from models import (
-    AdvisorOutput,
     EvaluationResult,
     InvestmentSpec,
     PortfolioProposal,
@@ -672,104 +671,5 @@ def run_refiner(
         expected_max_drawdown=data.get("expected_max_drawdown", 0),
         methodology=data.get("methodology", ""),
         rationale=data.get("rationale", ""),
-        raw_text=raw,
-    )
-
-
-# ---------------------------------------------------------------------------
-# AGENT 5 — ADVISOR  (advisory only, never modifies the portfolio)
-# ---------------------------------------------------------------------------
-ADVISOR_SYSTEM = textwrap.dedent("""\
-    You are a portfolio diversification advisor.  You are NOT allowed to
-    change the portfolio.  Your single job is to look at the FINAL
-    portfolio (which has already passed QA or been chosen as the best
-    effort) and surface two things for the human reader:
-
-    1. A pairwise CORRELATION SNAPSHOT for tickers that move similarly.
-       For every PAIR of holdings whose long-run correlation is |ρ| ≥ 0.5,
-       output an entry.  Use realistic historical correlations (you may
-       approximate from memory; this is a snapshot, not a backtest).
-       Be honest about uncertainty — these are model-recalled, not
-       computed from data.
-
-    2. Concrete SIMPLIFICATION SUGGESTIONS.  For each cluster of highly
-       correlated holdings (typically ρ ≥ 0.75) that look redundant,
-       propose a specific consolidation.
-
-    HARD RULES for suggestions:
-    • Suggest a REAL replacement ticker (e.g., GOVT, AGG, VXUS, BNDX)
-      that a US retail investor can buy easily.  Do not invent tickers.
-    • Be EXPLICIT about what the user gives up — every suggestion MUST
-      include a "tradeoff" string.  Examples of legitimate tradeoffs:
-        "Loses the explicit short/intermediate Treasury barbell."
-        "Loses tax-exempt muni income exposure."
-        "Combines investment-grade credit with Treasuries — credit risk
-         becomes implicit rather than sized separately."
-    • Do NOT suggest consolidations across genuinely different risk
-      factors (e.g., merging LQD into IEF collapses credit and rate
-      exposure — flag it as a NOT-recommended merge if you mention it).
-    • If the portfolio is already well-consolidated, return an empty
-      "suggestions" list rather than inventing weak ideas.
-
-    Respond ONLY with a JSON object:
-    {
-      "correlation_pairs": [
-        {"a": "TICKER_A", "b": "TICKER_B", "rho": 0.85,
-         "note": "optional short context"},
-        ...
-      ],
-      "suggestions": [
-        {
-          "merge_from": ["TICKER_X", "TICKER_Y"],
-          "merge_into": "REPLACEMENT_TICKER",
-          "rationale": "one-sentence why they overlap",
-          "tradeoff": "explicit description of what is lost"
-        },
-        ...
-      ],
-      "notes": "optional caveats about correlation estimates / regime sensitivity"
-    }
-
-    No markdown fences — raw JSON only.
-""")
-
-
-def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
-    """
-    Inspect a portfolio and produce advisory consolidation suggestions
-    plus a pairwise correlation snapshot.  Never modifies the portfolio
-    itself.  Used in two places by the orchestrator — between iterations
-    (its findings feed the next Generator round's prompt) and after the
-    final portfolio is determined (read-only, for the report).
-    """
-    print("\n" + "=" * 60)
-    print("ADVISOR — scanning final portfolio for correlation / simplification …")
-    print("=" * 60)
-
-    # Build a compact view of the holdings (ticker, weight, description)
-    rows = []
-    descs = final_proposal.descriptions or {}
-    for ticker, weight in final_proposal.allocations.items():
-        desc = descs.get(ticker, "")
-        rows.append(f"  {ticker:30s}  {float(weight):.2%}   {desc}")
-    holdings_block = "\n".join(rows) if rows else "  (empty)"
-
-    user_msg = (
-        f"FINAL PORTFOLIO (do NOT modify — advise only):\n{holdings_block}\n\n"
-        f"Produce the correlation snapshot and simplification suggestions "
-        f"per the system prompt schema.  Focus on pairs that move together "
-        f"in normal regimes; flag (in notes) any pairs whose correlation "
-        f"changes materially in stress."
-    )
-
-    raw = call_claude(ADVISOR_SYSTEM, user_msg, model=api.ADVISOR_MODEL)
-    print(raw[:500], "…\n" if len(raw) > 500 else "\n")
-
-    data = _parse_json_response(raw, agent="advisor")
-
-    return AdvisorOutput(
-        suggestions=data.get("suggestions", []) or [],
-        correlation_pairs=data.get("correlation_pairs", []) or [],
-        notes=data.get("notes", "") or "",
         raw_text=raw,
     )
