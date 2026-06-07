@@ -32,18 +32,18 @@ class RunRequest(BaseModel):
     model: Optional[str] = Field(
         None,
         description=(
-            "Override ALL three agent models. Aliases: 'haiku' | 'sonnet' "
+            "Override ALL agent models. Aliases: 'haiku' | 'sonnet' "
             "| 'opus', or a full Anthropic model ID. When omitted, the "
             "per-agent defaults are used (Opus for Generator/Evaluator/"
-            "Refiner, Sonnet for Planner, Haiku for Advisor) — same as "
-            "running `python harness.py` with no flags."
+            "Refiner, Sonnet for Planner) — same as running "
+            "`python harness.py` with no flags."
         ),
     )
     test: bool = Field(
         False,
         description=(
             "Test mode: forces all agents to Haiku, 1 iteration, and "
-            "skips refine/advise/price.  Mirrors `--test` on the CLI."
+            "skips refine/price/risk/correlation.  Mirrors `--test` on the CLI."
         ),
     )
     iterations: Optional[int] = Field(
@@ -83,7 +83,6 @@ class RunRequest(BaseModel):
         ),
     )
     refine: bool = Field(True, description="Run the post-selection Refiner pass.")
-    advise: bool = Field(True, description="Run the Advisor passes (intra-loop + final).")
     price: bool = Field(True, description="Run the yfinance pricing / lot-size check.")
     risk: bool = Field(
         True,
@@ -91,6 +90,15 @@ class RunRequest(BaseModel):
             "Run the post-selection Monte-Carlo return-distribution profile "
             "(block-bootstrap with long-history proxies). Mirrors `--no-risk` "
             "on the CLI (set false to skip). Ignored when test=true."
+        ),
+    )
+    correlation: bool = Field(
+        True,
+        description=(
+            "Run the post-selection no-LLM pairwise-correlation snapshot "
+            "(daily-return correlations from yfinance, flags |ρ| >= 0.85). "
+            "Mirrors `--no-correlation` on the CLI (set false to skip). "
+            "Ignored when test=true."
         ),
     )
     capital: float = Field(

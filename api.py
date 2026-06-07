@@ -38,12 +38,10 @@ import anthropic
 # Model selection (per-agent; patched by the CLI in harness.py)
 # ---------------------------------------------------------------------------
 MODEL = "claude-opus-4-7"
-# Per-agent overrides.  The Planner is mostly recall + JSON structuring
-# and the Advisor is pattern-matching against training memory — neither
-# needs Opus.  Generator / Evaluator / Refiner do the real reasoning
-# work and stay on MODEL (Opus by default).
+# Per-agent override.  The Planner is mostly recall + JSON structuring, so
+# it doesn't need Opus.  Generator / Evaluator / Refiner do the real
+# reasoning work and stay on MODEL (Opus by default).
 PLANNER_MODEL = "claude-sonnet-4-6"
-ADVISOR_MODEL = "claude-haiku-4-5-20251001"
 
 # ---------------------------------------------------------------------------
 # Token budgets

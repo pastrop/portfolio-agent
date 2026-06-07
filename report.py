@@ -212,6 +212,82 @@ def _push_risk_section(push: Any, result: dict[str, Any]) -> None:
         push("")
 
 
+def _push_correlation_section(push: Any, result: dict[str, Any]) -> None:
+    """
+    Render the 'Correlation Snapshot (computed)' section.
+
+    This replaces the old Advisor agent's recalled-from-memory correlation
+    table: the numbers here are computed from real yfinance history (see
+    ``correlation.py``), so they are trustworthy where the Advisor's were
+    not (it systematically misjudged the cash / short-duration sleeve).
+    """
+    corr = result.get("correlation") or {}
+    if corr.get("performed"):
+        push("## Correlation Snapshot (computed)")
+        push("")
+        if corr.get("disclaimer"):
+            push(f"> ⚠️ **How to read this.** {corr['disclaimer']}")
+            push("")
+
+        start = corr.get("sample_start", "")
+        end = corr.get("sample_end", "")
+        win = corr.get("window_years", 0) or 0
+        cov = float(corr.get("coverage_weight", 0) or 0)
+        freq = corr.get("frequency", "daily")
+        high_thr = float(corr.get("high_threshold", 0.85) or 0.85)
+        rep_thr = float(corr.get("report_threshold", 0.5) or 0.5)
+
+        push(f"- **Sample window:** {start} → {end} (~{win:g}y {freq} returns)")
+        push(f"- **Coverage:** {cov:.0%} of the book priced")
+        dropped = corr.get("dropped_tickers") or []
+        if dropped:
+            dr = ", ".join(f"`{t}`" for t in dropped)
+            push(
+                f"- **Excluded (no priceable history, e.g. option overlays):** "
+                f"{dr}"
+            )
+        push("")
+
+        pairs = corr.get("pairs") or []
+        high_n = int(corr.get("high_pairs_count", 0) or 0)
+        if pairs:
+            push(
+                f"Pairs with |ρ| ≥ {rep_thr:.2f} shown, strongest first. "
+                f"**{high_n}** pair(s) at |ρ| ≥ {high_thr:.2f} are flagged as "
+                f"highly redundant (⚠)."
+            )
+            push("")
+            push("| Ticker A | Ticker B | ρ | |")
+            push("|----------|----------|---:|:--|")
+            for p in pairs:
+                try:
+                    rho_s = f"{float(p.get('rho', 0)):+.2f}"
+                except (TypeError, ValueError):
+                    rho_s = str(p.get("rho", ""))
+                flag = " ⚠ high" if p.get("high") else ""
+                push(
+                    f"| `{p.get('a', '')}` | `{p.get('b', '')}` | "
+                    f"{rho_s} |{flag} |"
+                )
+            push("")
+        else:
+            push(
+                f"_No pairs at |ρ| ≥ {rep_thr:.2f} — the holdings are well "
+                f"diversified by this measure._"
+            )
+            push("")
+    elif corr.get("skipped_reason"):
+        push("## Correlation Snapshot (computed)")
+        push("")
+        push(f"_Correlation pass skipped — {corr['skipped_reason']}._")
+        push("")
+    elif corr.get("error"):
+        push("## Correlation Snapshot (computed)")
+        push("")
+        push(f"_Correlation pass could not run — {corr['error']}_")
+        push("")
+
+
 # ---------------------------------------------------------------------------
 # Horizon / posture header line (shared by both regimes)
 # ---------------------------------------------------------------------------
@@ -243,14 +319,14 @@ def _write_preservation_report(result: dict[str, Any], path: str) -> None:
     """
     Render the capital-preservation story for a ``mode == "preservation"``
     run.  Under the 3-year floor the optimizer is intentionally bypassed:
-    no Planner/Generator/Evaluator/Refiner/Advisor ran, so the usual
-    iteration / refinement / advisor sections would be empty shells.  We
-    skip them entirely and instead show:
+    no Planner/Generator/Evaluator/Refiner ran, so the usual iteration /
+    refinement sections would be empty shells.  We skip them entirely and
+    instead show:
 
       * a banner explaining the short-circuit,
       * the redirect message (why the optimizer was not run),
       * the deterministic template allocation table, and
-      * the (no-LLM) pricing & risk-profile sections.
+      * the (no-LLM) pricing, risk-profile, and correlation sections.
 
     ``final_proposal.expected_annual_return`` / ``expected_max_drawdown``
     are ``None`` in this regime, so every numeric format here guards
@@ -341,6 +417,9 @@ def _write_preservation_report(result: dict[str, Any], path: str) -> None:
     # ---- Return distribution (Monte-Carlo risk profile, no-LLM step) ----
     _push_risk_section(push, result)
 
+    # ---- Correlation snapshot (no-LLM step, populated) ----
+    _push_correlation_section(push, result)
+
     with open(path, "w") as f:
         f.write("\n".join(out))
 
@@ -375,9 +454,9 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
     horizon_posture = result.get("horizon_posture")
 
     # ---- Preservation short-circuit (<3y) ----
-    # In preservation mode NO LLM agents ran: iteration_history, refinement
-    # and advisor are empty/skipped stubs, so we render a dedicated story
-    # (banner + redirect + template table + pricing + risk) and return —
+    # In preservation mode NO LLM agents ran: iteration_history and refinement
+    # are empty/skipped stubs, so we render a dedicated story (banner +
+    # redirect + template table + pricing + risk + correlation) and return —
     # we deliberately do NOT fall through to the empty optimization shells.
     if mode == "preservation":
         _write_preservation_report(result, path)
@@ -416,16 +495,16 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push("- **Refinement:** performed — refined version NOT promoted (kept selected as final)")
     elif refinement.get("skipped_reason"):
         push(f"- **Refinement:** skipped ({refinement['skipped_reason']})")
-    advisor_hdr = result.get("advisor") or {}
-    if advisor_hdr.get("performed"):
-        n_sugg = len(advisor_hdr.get("suggestions") or [])
-        n_pairs = len(advisor_hdr.get("correlation_pairs") or [])
+    correlation_hdr = result.get("correlation") or {}
+    if correlation_hdr.get("performed"):
+        n_pairs = len(correlation_hdr.get("pairs") or [])
+        n_high = int(correlation_hdr.get("high_pairs_count", 0) or 0)
         push(
-            f"- **Advisor:** performed — {n_sugg} consolidation "
-            f"suggestion(s), {n_pairs} correlated pair(s) (advisory only)"
+            f"- **Correlation:** computed — {n_pairs} pair(s) at |ρ| ≥ 0.5, "
+            f"{n_high} highly redundant (|ρ| ≥ 0.85)"
         )
-    elif advisor_hdr.get("skipped_reason"):
-        push(f"- **Advisor:** skipped ({advisor_hdr['skipped_reason']})")
+    elif correlation_hdr.get("skipped_reason"):
+        push(f"- **Correlation:** skipped ({correlation_hdr['skipped_reason']})")
     pricing_hdr = result.get("pricing") or {}
     if pricing_hdr.get("performed"):
         n_failed = len(pricing_hdr.get("failed_tickers") or [])
@@ -711,94 +790,14 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push("</details>")
             push("")
 
-    # ---- Advisor (simplification suggestions + correlation snapshot) ----
-    advisor = result.get("advisor") or {}
-    if advisor.get("performed"):
-        push("## Simplification Suggestions (advisory — not applied)")
-        push("")
-        push(
-            "The Advisor inspected the **final portfolio** and produced "
-            "the suggestions below.  These are advisory only — the "
-            "portfolio above has NOT been modified.  Decide which (if "
-            "any) to apply yourself."
-        )
-        push("")
-
-        suggestions = advisor.get("suggestions") or []
-        if suggestions:
-            for idx, s in enumerate(suggestions, start=1):
-                merge_from = s.get("merge_from") or []
-                merge_into = s.get("merge_into") or ""
-                from_str = ", ".join(f"`{t}`" for t in merge_from) or "_(none)_"
-                push(f"### Suggestion {idx}: {from_str} → `{merge_into}`")
-                push("")
-                if s.get("rationale"):
-                    push(f"- **Why:** {s['rationale']}")
-                if s.get("tradeoff"):
-                    push(f"- **Tradeoff:** {s['tradeoff']}")
-                push("")
-        else:
-            push("_The Advisor did not propose any consolidations — the "
-                 "portfolio is already well-organised by this measure._")
-            push("")
-
-        pairs = advisor.get("correlation_pairs") or []
-        if pairs:
-            push("### Correlation snapshot")
-            push("")
-            push(
-                "Approximate long-run correlations (model-recalled, not "
-                "computed).  Pairs with |ρ| ≥ 0.5 are shown; sorted by "
-                "strongest first."
-            )
-            push("")
-            push("| Ticker A | Ticker B | ρ | Note |")
-            push("|----------|----------|---:|------|")
-            try:
-                pairs_sorted = sorted(
-                    pairs,
-                    key=lambda p: -abs(float(p.get("rho", 0))),
-                )
-            except (TypeError, ValueError):
-                pairs_sorted = pairs
-            for p in pairs_sorted:
-                try:
-                    rho = float(p.get("rho", 0))
-                    rho_s = f"{rho:+.2f}"
-                except (TypeError, ValueError):
-                    rho_s = str(p.get("rho", ""))
-                push(
-                    f"| `{p.get('a', '')}` | `{p.get('b', '')}` | "
-                    f"{rho_s} | {p.get('note', '') or ''} |"
-                )
-            push("")
-
-        if advisor.get("notes"):
-            push("### Advisor notes")
-            push("")
-            push(_format_value(advisor["notes"]))
-            push("")
-
-        if advisor.get("raw_text"):
-            push("<details><summary>Advisor raw response</summary>")
-            push("")
-            push("```")
-            push(advisor["raw_text"].rstrip())
-            push("```")
-            push("")
-            push("</details>")
-            push("")
-    elif advisor.get("skipped_reason"):
-        push("## Simplification Suggestions (advisory)")
-        push("")
-        push(f"_Advisor pass skipped — {advisor['skipped_reason']}._")
-        push("")
-
     # ---- Pricing & lot-size feasibility ----
     _push_pricing_section(push, result)
 
     # ---- Return distribution (Monte-Carlo risk profile) ----
     _push_risk_section(push, result)
+
+    # ---- Correlation snapshot (computed, no LLM) ----
+    _push_correlation_section(push, result)
 
     # ---- Per-iteration detail ----
     push("## Iteration History (detailed)")
@@ -819,18 +818,6 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push(f"- **Average score:** {h.get('average_score')}")
             push(f"- **Expected return:** {h.get('expected_return')}")
             push(f"- **Expected max drawdown:** {h.get('expected_max_drawdown')}")
-        # Intra-iteration advisor pair count — evidence that the
-        # advisor-in-the-loop feedback signal was active for this round.
-        # Absent in older traces (key won't exist); a count of 0 also
-        # means "nothing actionable was fed forward" — show it either way
-        # so the loop's behavior is visible.
-        intra_n = h.get("intra_advisor_pairs_count")
-        if intra_n is not None:
-            next_iter = (h.get("iteration") or 0) + 1
-            push(
-                f"- **Advisor pairs fed to iteration {next_iter}:** "
-                f"{intra_n}"
-            )
         push("")
         scores_i = h.get("scores") or {}
         if scores_i:
