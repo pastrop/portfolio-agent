@@ -161,7 +161,8 @@ Plus yfinance batches for pricing / risk / correlation (no API key needed; per-t
 | Flag | Effect |
 |---|---|
 | `--test` | Smoke-test mode: Haiku 4.5 for ALL agents, 1 iteration, no refinement, no pricing, no risk, no correlation. ~3 API calls, cheapest end-to-end verification of the plumbing. Useful when Opus is overloaded or you just want to see the flow run. |
-| `--model {haiku\|sonnet\|opus\|<full-id>}` | Override the model **for all agents** (planner / generator / evaluator / refiner). Aliases resolve to `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-7`. Any other string is passed through verbatim as a model ID. |
+| `--model {haiku\|sonnet\|opus\|fable\|<full-id>}` | Override the model **for all agents** (planner / generator / evaluator / refiner). Aliases resolve to `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-7`, `claude-fable-5`. Any other string is passed through verbatim as a model ID. |
+| `--reasoning-model {haiku\|sonnet\|opus\|fable\|<full-id>}` | Override the model for **only the heavy reasoning agents** (generator / evaluator / refiner), leaving the **Planner** on its own model. Use it to A/B a reasoning model — e.g. `--reasoning-model fable` runs the reasoning agents on Claude Fable 5 (≈2× Opus cost) while the Planner stays on Sonnet. Ignored under `--test`; if combined with `--model`, this wins for the heavy agents. |
 | `--iterations N` | Override `MAX_ITERATIONS` for this run (default 3). |
 | `--max-loss FRACTION` | Override the max annual loss budget (`TARGET_MAX_LOSS`) as a fraction in `(0, 1)` — e.g. `0.10` for 10% (default 5%). Drives the Generator / Evaluator / Refiner prompts, the selection target, and the auto-derived under-utilisation band. **Unlike the other flags, this applies in `--test` mode too.** |
 | `--no-refine` | Skip the post-selection Refiner pass. |
@@ -183,6 +184,10 @@ uv run python harness.py --test
 
 # Opus is overloaded? Full 3-iteration run on Sonnet (overrides per-agent split)
 uv run python harness.py --model sonnet
+
+# A/B a reasoning model: run Generator/Evaluator/Refiner on Claude Fable 5,
+# Planner stays on Sonnet (≈2x Opus cost on the reasoning calls)
+uv run python harness.py --reasoning-model fable
 
 # Skip the computed correlation snapshot
 uv run python harness.py --no-correlation

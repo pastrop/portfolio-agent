@@ -981,6 +981,7 @@ if __name__ == "__main__":
         "haiku":  "claude-haiku-4-5-20251001",
         "sonnet": "claude-sonnet-4-6",
         "opus":   "claude-opus-4-7",
+        "fable":  "claude-fable-5",
     }
 
     parser = argparse.ArgumentParser(
@@ -992,6 +993,7 @@ if __name__ == "__main__":
               uv run python harness.py --test
               uv run python harness.py --model sonnet
               uv run python harness.py --model haiku --iterations 1
+              uv run python harness.py --reasoning-model fable
               uv run python harness.py --no-refine
               uv run python harness.py --no-prices
               uv run python harness.py --no-risk
@@ -1015,8 +1017,22 @@ if __name__ == "__main__":
         "--model",
         metavar="MODEL",
         help=(
-            "Override the model. Accepts short aliases (haiku, sonnet, opus) or a "
-            "full Anthropic model ID. Ignored when --test is also set."
+            "Override the model for ALL agents. Accepts short aliases "
+            "(haiku, sonnet, opus, fable) or a full Anthropic model ID. "
+            "Ignored when --test is also set."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-model",
+        metavar="MODEL",
+        help=(
+            "Override the model for ONLY the heavy reasoning agents "
+            "(Generator / Evaluator / Refiner), leaving the Planner on its "
+            "own model. Same aliases as --model (haiku, sonnet, opus, fable) "
+            "or a full model ID. Use this to A/B a reasoning model "
+            "(e.g. --reasoning-model fable) without dragging the Planner into "
+            "it. Ignored under --test; if combined with --model, this wins "
+            "for the heavy agents."
         ),
     )
     parser.add_argument(
@@ -1160,6 +1176,18 @@ if __name__ == "__main__":
             print(
                 f"[per-agent models] generator/evaluator/refiner={api.MODEL}  "
                 f"planner={api.PLANNER_MODEL}"
+            )
+        # --reasoning-model overrides ONLY the heavy agents (Generator /
+        # Evaluator / Refiner) by patching api.MODEL, leaving api.PLANNER_MODEL
+        # untouched — so a reasoning model (e.g. Fable 5) can be A/B'd without
+        # dragging the Planner into it.  Applied AFTER --model so it wins for
+        # the heavy agents.
+        if args.reasoning_model:
+            resolved_rm = _MODEL_ALIASES.get(args.reasoning_model, args.reasoning_model)
+            api.MODEL = resolved_rm
+            print(
+                f"[reasoning-model override — generator/evaluator/refiner] "
+                f"{api.MODEL}  (planner stays {api.PLANNER_MODEL})"
             )
         if args.iterations is not None:
             if args.iterations < 1:

@@ -18,6 +18,7 @@ MODEL_ALIASES: dict[str, str] = {
     "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-7",
+    "fable": "claude-fable-5",
 }
 
 
@@ -33,10 +34,22 @@ class RunRequest(BaseModel):
         None,
         description=(
             "Override ALL agent models. Aliases: 'haiku' | 'sonnet' "
-            "| 'opus', or a full Anthropic model ID. When omitted, the "
-            "per-agent defaults are used (Opus for Generator/Evaluator/"
+            "| 'opus' | 'fable', or a full Anthropic model ID. When omitted, "
+            "the per-agent defaults are used (Opus for Generator/Evaluator/"
             "Refiner, Sonnet for Planner) — same as running "
             "`python harness.py` with no flags."
+        ),
+    )
+    reasoning_model: Optional[str] = Field(
+        None,
+        description=(
+            "Override the model for ONLY the heavy reasoning agents "
+            "(Generator / Evaluator / Refiner), leaving the Planner on its "
+            "own model. Same aliases as `model` ('haiku' | 'sonnet' | 'opus' "
+            "| 'fable') or a full model ID. Mirrors `--reasoning-model` on the "
+            "CLI — use it to A/B a reasoning model (e.g. 'fable') without "
+            "changing the Planner. Ignored when test=true; if combined with "
+            "`model`, this wins for the heavy agents."
         ),
     )
     test: bool = Field(
