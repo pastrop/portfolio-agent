@@ -235,6 +235,13 @@ def execute_run_sync(
     if override_model is not None:
         api.MODEL = override_model
         api.PLANNER_MODEL = override_model
+    # --reasoning-model equivalent: override ONLY the heavy agents (api.MODEL),
+    # leaving the Planner. Ignored under test (which forces Haiku everywhere).
+    # Applied after the all-agent override so it wins for the heavy agents.
+    # api.MODEL is already snapshotted above, so the finally-block restore
+    # covers this with no extra bookkeeping.
+    if not req.test and req.reasoning_model:
+        api.MODEL = MODEL_ALIASES.get(req.reasoning_model, req.reasoning_model)
     if iterations is not None:
         harness.MAX_ITERATIONS = iterations
     # --max-loss equivalent: patch TARGET_MAX_LOSS and recompute the
@@ -266,6 +273,7 @@ def execute_run_sync(
             _REAL_STDOUT.write(
                 f"\n[run {artifacts_dir.name}] starting "
                 f"(model_override={override_model or '<per-agent mix>'}, "
+                f"reasoning_model={(req.reasoning_model or '-') if not req.test else '-'}, "
                 f"iterations={iterations if iterations is not None else harness.MAX_ITERATIONS}, "
                 f"horizon={req.horizon_years}y, "
                 f"refine={refine}, price={price}, risk={risk}, "

@@ -300,7 +300,13 @@ def run_generator(
         user_msg += f"\nEVALUATOR FEEDBACK FROM PREVIOUS ROUND:\n{feedback}\n"
         user_msg += "\nAddress every issue raised.  Revise the portfolio accordingly."
 
-    raw = call_claude(generator_system(max_loss), user_msg)
+    raw = call_claude(
+        generator_system(max_loss), user_msg,
+        # The Generator emits a full portfolio JSON after its reasoning; on an
+        # always-on-thinking model (e.g. Fable 5) the 4096 default is consumed
+        # by thinking before any text is emitted.  See api.GENERATOR_MAX_TOKENS.
+        max_tokens=api.GENERATOR_MAX_TOKENS,
+    )
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
     data = _parse_json_response(raw, agent="generator")
