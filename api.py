@@ -38,26 +38,32 @@ import anthropic
 # Model selection (per-agent; patched by the CLI in harness.py)
 # ---------------------------------------------------------------------------
 MODEL = "claude-opus-4-7"
-# Per-agent overrides.  The Planner is mostly recall + JSON structuring
-# and the Advisor is pattern-matching against training memory — neither
-# needs Opus.  Generator / Evaluator / Refiner do the real reasoning
-# work and stay on MODEL (Opus by default).
+# Per-agent override.  The Planner is mostly recall + JSON structuring, so
+# it doesn't need Opus.  Generator / Evaluator / Refiner do the real
+# reasoning work and stay on MODEL (Opus by default).
 PLANNER_MODEL = "claude-sonnet-4-6"
-ADVISOR_MODEL = "claude-haiku-4-5-20251001"
 
 # ---------------------------------------------------------------------------
 # Token budgets
 # ---------------------------------------------------------------------------
 MAX_TOKENS = 4096
-# The Refiner emits a full portfolio (allocations + descriptions + numbers)
-# AND a point-by-point response to every critique item — by far the most
-# output-heavy agent.  4096 tokens regularly truncates mid-string, which
-# previously crashed the JSON parser.  Give it more headroom.
-REFINER_MAX_TOKENS = 8192
-# The Planner's spec is detailed (objective, constraints, asset_universe,
-# risk_budget, evaluation_criteria) and now incorporates web_search
-# findings.  Web search also induces some narration overhead before the
-# final JSON.  4096 truncates regularly; bump to match Refiner's headroom.
+# ---- Heavy reasoning-agent headroom (Generator / Evaluator / Refiner) ----
+# These agents emit structured JSON AFTER a chunk of reasoning, and modern
+# models run adaptive "thinking" that is ALWAYS ON (Opus 4.x, Claude Fable 5);
+# those thinking tokens count against max_tokens.  A powerful thinker like
+# Fable 5 can spend the entire 4096 default on thinking and emit ZERO text
+# (stop_reason=max_tokens, 0-char response -> `_parse_json_response` falls back
+# to an empty dict and the agent's output is lost).  max_tokens is a CEILING,
+# not a target — you are billed for tokens actually generated, and adaptive
+# thinking self-regulates — so a generous ceiling is free insurance and does
+# not change cost or behavior on lighter-thinking models like Opus.
+GENERATOR_MAX_TOKENS = 16384   # full portfolio JSON (allocations + descriptions
+                               # + methodology + rationale) after reasoning
+REFINER_MAX_TOKENS = 16384     # portfolio JSON + point-by-point critique reply
+EVALUATOR_MAX_TOKENS = 16384   # multi-round backtest narration + scores/critique
+# The Planner runs on Sonnet and is NOT affected by --reasoning-model; its
+# spec (objective / constraints / asset_universe / risk_budget /
+# evaluation_criteria) plus web_search narration fits comfortably in 8192.
 PLANNER_MAX_TOKENS = 8192
 
 

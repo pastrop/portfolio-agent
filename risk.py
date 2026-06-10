@@ -169,6 +169,44 @@ def _resolve_proxies(
     return proxy_weights, substitutions, total
 
 
+def bracket_horizons(horizon_years: int | None) -> tuple[int, ...]:
+    """
+    Choose the Monte-Carlo reporting horizons so the table BRACKETS the run's
+    investment horizon — the reader sees outcomes shorter than, at, and longer
+    than the target rather than the fixed 1/3/5/10y set regardless of horizon.
+
+    Contract (deliberately conservative about the acceptance gate):
+
+      * ``horizon_years is None`` or ``horizon_years == 10`` -> the historical
+        default ``RISK_HORIZONS`` (``(1, 3, 5, 10)``) is returned UNCHANGED, so
+        a no-flag / default run reproduces today's exact table byte-for-byte.
+      * otherwise -> a deterministic, sorted, de-duplicated tuple that always
+        CONTAINS ``horizon_years`` itself and places a shorter and a longer
+        outcome on either side of it (a "near" point at roughly ⅓ and a "far"
+        point at roughly 2× the target), anchored on a short reference point so
+        the early-life picture never disappears.
+
+    Purely arithmetic — no randomness — so the chosen grid is itself
+    reproducible (the bootstrap seeding lives in ``RISK_SEED``).
+    """
+    # Default / explicit-10 -> preserve today's table exactly (acceptance gate).
+    if horizon_years is None or horizon_years == 10:
+        return RISK_HORIZONS
+
+    h = int(horizon_years)
+    if h < 1:                       # defensive: callers validate >= 1 upstream
+        h = 1
+
+    # Bracket points around the target: a short anchor, a "near" point below
+    # the target, the target itself, and a "far" point above it.  max()/int()
+    # keep everything a positive whole number of years and collapse degenerate
+    # cases (e.g. very short horizons) onto the target without duplication.
+    near = max(1, h // 3)           # ~⅓ of the way in — the shorter outcome
+    far = max(h + 1, h * 2)         # ~2× the target — the longer outcome
+    candidates = {1, near, h, far}  # 1y anchor keeps the early-life picture
+    return tuple(sorted(candidates))
+
+
 def _bootstrap_terminal(port, horizon_years, n_sims, block, rng):
     """Block-bootstrap ``n_sims`` terminal compounded returns over the horizon."""
     import numpy as np
@@ -193,7 +231,8 @@ def _bootstrap_terminal(port, horizon_years, n_sims, block, rng):
 def run_risk_profile(
     allocations: Mapping[str, float],
     *,
-    horizons: tuple[int, ...] = RISK_HORIZONS,
+    horizon_years: int | None = None,
+    horizons: tuple[int, ...] | None = None,
     n_sims: int = RISK_N_SIMS,
     block_days: int = RISK_BLOCK_DAYS,
     seed: int = RISK_SEED,
@@ -202,9 +241,26 @@ def run_risk_profile(
     Build a return-distribution risk profile for ``allocations`` (a mapping
     of ticker -> weight; pass ``final_proposal.allocations`` directly).
 
+    Reporting horizons are chosen so the table BRACKETS the run's investment
+    horizon:
+
+      * pass ``horizon_years`` (the run's ``--horizon-years`` value) and the
+        grid is derived via :func:`bracket_horizons` to surround that target
+        with a shorter and a longer outcome.  ``horizon_years`` of ``None`` or
+        ``10`` (the default) preserves today's fixed ``(1, 3, 5, 10)`` table —
+        the acceptance gate for a no-flag run.
+      * pass ``horizons`` to override the grid explicitly (wins over
+        ``horizon_years``); when neither is supplied the historical default
+        ``RISK_HORIZONS`` is used.
+
     Never raises — on any failure the returned result's ``error`` field is
     populated so the report can render a helpful note.
     """
+    # Resolve the reporting grid: an explicit ``horizons`` override wins; else
+    # bracket the run's ``horizon_years`` (which falls back to the default
+    # 1/3/5/10y set when None or 10).
+    if horizons is None:
+        horizons = bracket_horizons(horizon_years)
     print("\n" + "=" * 60)
     print("RISK PROFILE — bootstrapping the return distribution …")
     print("=" * 60)

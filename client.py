@@ -7,7 +7,7 @@ optionally saves the markdown report locally.
 Usage examples
 --------------
 
-    # Smoke test (Haiku, 1 iteration, no refine/advise/price)
+    # Smoke test (Haiku, 1 iteration, no refine/price/correlation)
     uv run python client.py --test "smoke test goal"
 
     # Full default run
@@ -45,8 +45,8 @@ def _build_request_body(args: argparse.Namespace) -> dict:
         "goal": args.goal,
         "test": args.test,
         "refine": not args.no_refine,
-        "advise": not args.no_advise,
         "price": not args.no_price,
+        "correlation": not args.no_correlation,
         "capital": args.capital,
     }
     if args.model is not None:
@@ -135,12 +135,12 @@ def main() -> None:
                         help="Override all agents. Aliases: haiku|sonnet|opus, or a full model ID. "
                              "Omit for the per-agent mix.")
     parser.add_argument("--test", action="store_true",
-                        help="Mirror --test on the CLI: all-Haiku, 1 iteration, skip refine/advise/price.")
+                        help="Mirror --test on the CLI: all-Haiku, 1 iteration, skip refine/price/correlation.")
     parser.add_argument("--iterations", type=int, default=None,
                         help="Override MAX_ITERATIONS. Ignored when --test is also set.")
     parser.add_argument("--no-refine", action="store_true")
-    parser.add_argument("--no-advise", action="store_true")
     parser.add_argument("--no-price", action="store_true")
+    parser.add_argument("--no-correlation", action="store_true")
     parser.add_argument("--capital", type=float, default=100_000.0,
                         help="Investable capital in USD (default 100000).")
     parser.add_argument("--poll", type=float, default=DEFAULT_POLL_SECONDS,

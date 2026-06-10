@@ -120,6 +120,13 @@ SYSTEM_PROMPT = textwrap.dedent("""\
       "max_iterations": int,              # e.g. 3
       "pass_threshold": int,              # e.g. 7
       "target_max_loss": float,           # e.g. 0.05  (5% loss cap)
+      "mode": str,                        # "optimized" | "preservation"
+                                          #   (missing ⇒ treat as "optimized")
+      "horizon_years": int,               # investment horizon, e.g. 10
+      "horizon_posture": str,             # derived risk-posture label, e.g.
+                                          #   "Growth" / "Balanced growth" /
+                                          #   "Conservative balanced" /
+                                          #   "Capital preservation"
       "spec": {                           # output of the Planner
         "objective": str | dict,
         "constraints": str | dict,
@@ -145,7 +152,6 @@ SYSTEM_PROMPT = textwrap.dedent("""\
           "average_score": float,
           "passed": bool,
           "critique_snippet": str,        # first 300 chars of critique
-          "intra_advisor_pairs_count": int | null,  # pairs fed back to next iter
           "selected": bool                # the one the Selector kept
         }, ...
       ],
@@ -179,16 +185,20 @@ SYSTEM_PROMPT = textwrap.dedent("""\
         "refined_proposal": {...same shape as final_proposal...},
         "refined_evaluation": {...same shape as final_evaluation...}
       },
-      "advisor": {                        # final read-only advisor pass
+      "correlation": {                    # computed pairwise-correlation snapshot (no LLM)
         "performed": bool,
-        "suggestions": [
-          {"merge_from": [ticker, ...], "merge_into": ticker,
-           "rationale": str, "tradeoff": str}, ...
+        "skipped_reason": str | null,
+        "window_years": int,              # trailing window used
+        "sample_start": str, "sample_end": str, "sample_days": int,
+        "frequency": "daily",
+        "coverage_weight": float,         # fraction of the book priced (0-1)
+        "modeled_tickers": [ticker, ...],
+        "dropped_tickers": [ticker, ...], # no priceable history (e.g. option overlays)
+        "pairs": [                        # |rho| >= 0.5, sorted strongest first
+          {"a": ticker_a, "b": ticker_b, "rho": float, "high": bool}, ...
         ],
-        "correlation_pairs": [            # |rho| >= 0.5
-          {"a": ticker_a, "b": ticker_b, "rho": float, "note": str | null}, ...
-        ],
-        "notes": str
+        "high_pairs_count": int,          # pairs at |rho| >= 0.85 (highly redundant)
+        "error": str | null
       },
       "pricing": {                        # yfinance lot-size feasibility
         "performed": bool,
@@ -239,6 +249,15 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     --no-risk, or carry an `error` when offline).  Handle absence
     gracefully — hide the corresponding section rather than rendering
     empty placeholders.
+
+    When `mode == "preservation"` (short horizon — the optimizer was
+    deliberately bypassed), tell the PRESERVATION STORY: the deterministic
+    capital-preservation template (final_proposal.allocations), the
+    redirect_message explaining why the horizon was redirected, plus the
+    pricing and risk_profile sections.  Do NOT render empty QA / iteration
+    sections in this mode — iteration_history is [], refinement is
+    skipped, and final_proposal.expected_annual_return /
+    expected_max_drawdown are null (guard any formatting on them).
 
     Now generate the dashboard.
 """)

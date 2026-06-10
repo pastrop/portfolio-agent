@@ -5,13 +5,13 @@ A multi-agent harness inspired by Anthropic's "Harness design for
 long-running application development" blog post, applied to financial
 portfolio optimisation.
 
-Composition (Planner → (Generator ↔ Evaluator + intra-Advisor) × N →
-Selector → Refiner → Re-evaluate → Final Advisor → Pricing) lives in
-this file.  The five LLM agents themselves are in ``agents.py``; the
-Anthropic client wrapper and JSON parser are in ``api.py``; the
-dataclasses passed between agents are in ``models.py``; the markdown
-report writer is in ``report.py``; the yfinance-backed lot-size step
-is in ``pricing.py``.
+Composition (Planner → (Generator ↔ Evaluator) × N → Selector → Refiner
+→ Re-evaluate → Pricing → Risk → Correlation) lives in this file.  The
+four LLM agents themselves are in ``agents.py``; the Anthropic client
+wrapper and JSON parser are in ``api.py``; the dataclasses passed between
+agents are in ``models.py``; the markdown report writer is in
+``report.py``; the yfinance-backed lot-size step is in ``pricing.py``;
+the no-LLM pairwise-correlation snapshot is in ``correlation.py``.
 
 This is a *concept exploration* — most data is model-recalled, not
 computed from market feeds (except for the Pricing step's yfinance
@@ -27,29 +27,28 @@ from typing import Any
 
 import api
 from agents import (
-    run_advisor,
     run_evaluator,
     run_generator,
     run_planner,
     run_refiner,
 )
 from models import (
-    AdvisorOutput,
     EvaluationResult,
     InvestmentSpec,
     PortfolioProposal,
 )
+from correlation import CORRELATION_DISCLAIMER, run_correlation
 from pricing import DEFAULT_CAPITAL, PRICING_DISCLAIMER, run_pricing
 from report import write_markdown_report
-from risk import RISK_DISCLAIMER, run_risk_profile
+from risk import RISK_DISCLAIMER, RISK_PROXY_MAP, run_risk_profile
 
 # ---------------------------------------------------------------------------
 # Orchestrator-only policy constants
 # ---------------------------------------------------------------------------
 # (Model / token / retry config lives in api.py; per-agent model selection
-# is api.MODEL / api.PLANNER_MODEL / api.ADVISOR_MODEL.  The CLI block at
-# the bottom of this file patches those module-level globals when --test
-# or --model X is provided.)
+# is api.MODEL / api.PLANNER_MODEL.  The CLI block at the bottom of this
+# file patches those module-level globals when --test or --model X is
+# provided.)
 MAX_ITERATIONS = 3          # generator ↔ evaluator rounds
 PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
 TARGET_MAX_LOSS = 0.05      # default loss budget we want expected_max_drawdown to land on (overridable via --max-loss)
@@ -59,12 +58,390 @@ TARGET_MAX_LOSS = 0.05      # default loss budget we want expected_max_drawdown 
 # UNDER_UTILISATION_BAND = UNDER_UTILISATION_RATIO * TARGET_MAX_LOSS.
 UNDER_UTILISATION_RATIO = 0.8
 UNDER_UTILISATION_BAND = UNDER_UTILISATION_RATIO * TARGET_MAX_LOSS
-# Threshold for which Advisor-flagged correlation pairs count as
-# actionable feedback for the next Generator iteration.  The Advisor
-# surfaces pairs at |ρ| ≥ 0.5 for the report, but for prompt feedback
-# we only want the egregious overlaps (≥ 0.7) so the next prompt
-# isn't cluttered with marginal pairs.
-ADVISOR_FEEDBACK_RHO_THRESHOLD = 0.7
+
+# ---------------------------------------------------------------------------
+# Horizon policy (Phase 2) — horizon = risk CAPACITY
+# ---------------------------------------------------------------------------
+# `--horizon-years N` makes the recommended portfolio horizon-aware.  The
+# mental model: horizon is risk *capacity*; `--max-loss` is risk *tolerance*.
+# They bind independently and the MORE CONSERVATIVE wins.  At long horizons
+# the max-loss budget binds (≈ today's output); at short horizons the
+# horizon ceiling binds.
+#
+# DEFAULT_HORIZON_YEARS is 10 deliberately: a no-flag run lands in the
+# topmost glide-path band (90% growth ceiling, which never bites a sane
+# max-loss-constrained book) and so reproduces today's output byte-for-byte.
+# This is the Phase 2 acceptance gate — do NOT change it without re-baselining
+# harness_output.json.
+DEFAULT_HORIZON_YEARS = 10
+# Hard floor: anything below this short-circuits to a deterministic
+# capital-preservation template and the optimizer NEVER runs (no LLM agents).
+# There is no escape hatch — a 2-year horizon has no business holding an
+# equity-heavy book regardless of stated risk tolerance.
+HORIZON_FLOOR_YEARS = 3
+
+# Glide path (optimizer regime, horizon_years >= 3): a ceiling on the
+# combined weight of GROWTH assets (equity + REIT + commodity + high-yield).
+# The remainder must be high-grade bonds / TIPS / cash.  Bands are
+# HALF-OPEN on the right: [low, high).  An ordered list so the first band
+# whose [low, high) contains the horizon wins; the final band runs to
+# infinity (encoded as ``None`` high).
+#   horizon 3 -> 0.50,  horizon 5 -> 0.75,  horizon 10 -> 0.90.
+HORIZON_GLIDE_PATH: list[dict[str, Any]] = [
+    {"low": 3,  "high": 5,    "label": "Conservative balanced", "band": "3-5y",  "growth_ceiling": 0.50},
+    {"low": 5,  "high": 10,   "label": "Balanced growth",       "band": "5-10y", "growth_ceiling": 0.75},
+    {"low": 10, "high": None, "label": "Growth",                "band": "10y+",  "growth_ceiling": 0.90},
+]
+
+# Preservation templates (short-circuit regime, horizon_years < 3): fixed,
+# deterministic allocations — no LLM judgement, no optimisation.  These ARE
+# the answer below the floor.
+#   1 <= horizon < 3 -> "1-3y";  horizon < 1 -> "<1y".
+PRESERVATION_TEMPLATES: dict[str, dict[str, float]] = {
+    "1-3y": {"SGOV": 0.40, "SHY": 0.40, "VTIP": 0.20},
+    "<1y":  {"SGOV": 1.00},
+}
+# Posture label reported for any preservation-mode run.
+PRESERVATION_POSTURE = "Capital preservation"
+
+# ---------------------------------------------------------------------------
+# Growth-asset classifier (shared with the Evaluator's deterministic ceiling
+# check in agents.py via `growth_asset_weight`)
+# ---------------------------------------------------------------------------
+# The glide path caps GROWTH-asset weight, but PortfolioProposal has NO
+# structured asset-class field (allocations is just ticker -> weight), so we
+# must classify each holding ourselves.  This is a heuristic, FAIL-SOFT
+# classifier — it errs toward counting an *unclassifiable* holding AS growth
+# (the conservative choice for a ceiling check: an unknown sleeve can only
+# tighten the gate, never loosen it, so the deterministic Evaluator check can
+# never wave through a genuinely over-the-ceiling book on a classification
+# miss).
+#
+# "Growth" = equity (US / international / EM / factor / dividend / small-cap),
+# REITs, broad commodities, gold, managed futures, and HIGH-YIELD credit —
+# i.e. the spec's growth bucket plus the risk sleeves that behave like it.
+# "Defensive" = high-grade bonds (Treasuries, IG credit, aggregate, munis),
+# TIPS / inflation-linked, and cash / T-bills.  Options overlays and explicit
+# CASH/USD sleeves are treated as defensive (they don't consume the growth
+# budget).
+#
+# Three classification signals, in priority order:
+#   1. Exact ticker membership in the curated growth / defensive sets below
+#      (built from the Generator prompt's overlap groups + risk.RISK_PROXY_MAP
+#      so every proxy'd young ETF resolves too).
+#   2. The risk.RISK_PROXY_MAP long-history proxy (e.g. SCHD -> VIG): if the
+#      proxy is classifiable, inherit its class.
+#   3. Keyword scan of the holding's one-line description (e.g. "equity",
+#      "REIT", "high yield", "treasury", "TIPS", "cash") as a last resort.
+# Anything still unresolved -> counted as growth (fail-soft, see above).
+
+# Defensive tickers: high-grade bonds, TIPS, cash.  (Drawn from the Generator
+# overlap groups + the bond/cash/TIPS entries of RISK_PROXY_MAP's domain.)
+_DEFENSIVE_TICKERS: frozenset[str] = frozenset({
+    # intermediate Treasuries
+    "IEF", "GOVT", "VGIT", "SCHR",
+    # long Treasuries
+    "TLT", "EDV", "VGLT", "SPTL",
+    # short Treasuries / cash / T-bills
+    "SHV", "SHY", "BIL", "SGOV", "GBIL",
+    # investment-grade credit
+    "LQD", "VCIT", "VCSH", "IGIB", "IGSB",
+    # US aggregate bonds
+    "AGG", "BND", "SCHZ", "IUSB",
+    # TIPS / inflation-linked
+    "TIP", "SCHP", "VTIP", "STIP", "LTPZ",
+    # municipal bonds
+    "MUB", "VTEB", "TFI", "SUB", "VWITX",
+})
+# Growth tickers: equity (broad / factor / dividend / small-cap / int'l / EM),
+# REITs, gold, broad commodities, managed futures, high-yield credit.
+_GROWTH_TICKERS: frozenset[str] = frozenset({
+    # US broad equity
+    "VOO", "VTI", "SPY", "IVV", "SPLG", "ITOT", "SCHB",
+    # US large-cap factor tilts
+    "QUAL", "MTUM", "VLUE", "USMV", "SPHQ", "SPLV",
+    # US dividend tilts
+    "SCHD", "DGRO", "VYM", "HDV", "NOBL", "DVY", "VIG",
+    # US small-cap
+    "IWM", "VB", "IJR", "SCHA", "VTWO",
+    # int'l developed equity
+    "VEA", "IEFA", "VXUS", "SCHF", "IDEV", "EFA",
+    # emerging-market equity
+    "VWO", "IEMG", "EEM", "SCHE", "SPEM",
+    # high-yield credit (behaves like equity in stress -> growth bucket)
+    "HYG", "JNK", "USHY", "SHYG",
+    # gold
+    "GLD", "IAU", "GLDM", "SGOL", "BAR",
+    # broad commodities
+    "DBC", "PDBC", "GSG", "BCI", "COMT",
+    # US REITs
+    "VNQ", "IYR", "SCHH", "XLRE", "RWR",
+    # managed futures
+    "DBMF", "KMLM", "CTA", "WTMF",
+})
+# Description keywords, scanned only when ticker + proxy both miss.  Order
+# matters: a defensive keyword wins over a growth one ONLY when no growth
+# keyword is present (so "high-yield bond" -> growth, "treasury bond" ->
+# defensive).
+_GROWTH_KEYWORDS: tuple[str, ...] = (
+    "equity", "stock", "s&p", "nasdaq", "reit", "real estate", "commodit",
+    "gold", "managed futures", "high yield", "high-yield", "emerging",
+    "small-cap", "small cap", "dividend",
+)
+_DEFENSIVE_KEYWORDS: tuple[str, ...] = (
+    "treasury", "t-bill", "bill", "tips", "inflation-linked", "inflation linked",
+    "aggregate bond", "investment-grade", "investment grade", "municipal",
+    "muni", "cash", "money market", "money-market", "government bond",
+)
+
+
+def _classify_holding(ticker: str, description: str = "") -> str:
+    """
+    Classify a single holding as ``"growth"`` or ``"defensive"``.
+
+    FAIL-SOFT: an unclassifiable holding returns ``"growth"`` so that the
+    Evaluator's ceiling check can only ever be tightened — never loosened —
+    by a classification miss (an unknown sleeve must not silently buy room
+    under the growth ceiling).  See the module-level note above for the
+    full rationale and the three-signal priority order.
+    """
+    t = (ticker or "").strip().upper()
+    if t in _DEFENSIVE_TICKERS:
+        return "defensive"
+    if t in _GROWTH_TICKERS:
+        return "growth"
+
+    # Signal 2: inherit the long-history proxy's class, if it resolves.
+    proxy = RISK_PROXY_MAP.get(t)
+    if proxy is not None:
+        p = proxy.upper()
+        if p in _DEFENSIVE_TICKERS:
+            return "defensive"
+        if p in _GROWTH_TICKERS:
+            return "growth"
+
+    # Signal 3: keyword scan of the description.  A growth keyword wins over
+    # a defensive one (so "high-yield bond" lands in growth).
+    desc = (description or "").lower()
+    if any(kw in desc for kw in _GROWTH_KEYWORDS):
+        return "growth"
+    if any(kw in desc for kw in _DEFENSIVE_KEYWORDS):
+        return "defensive"
+
+    # Explicit cash sleeves the keyword list might miss.
+    if t in {"CASH", "USD", "MONEY_MARKET"}:
+        return "defensive"
+    # Options overlays / hedges named like SPX_PUT_SPREAD: a hedge is not a
+    # growth asset, so treat any holding whose name screams "hedge/put/option"
+    # as defensive rather than fail-soft growth.
+    if any(kw in t for kw in ("PUT", "HEDGE", "OPTION", "COLLAR")):
+        return "defensive"
+
+    # Fail-soft default: count the unknown holding as growth.
+    return "growth"
+
+
+def growth_asset_weight(proposal: PortfolioProposal) -> float:
+    """
+    Return the combined weight of GROWTH assets in ``proposal``'s
+    allocations, as a fraction in [0, 1] (normalised by the total weight so
+    a book whose weights don't sum to exactly 1.0 still yields a comparable
+    fraction).
+
+    This is the shared classifier behind the glide-path ceiling: the harness
+    uses it for diagnostics and the Evaluator (in ``agents.py``) imports it
+    for its deterministic, hard pass/fail growth-ceiling check.  See the
+    classifier note above for the heuristic + its fail-soft contract.
+    """
+    allocations = proposal.allocations or {}
+    descriptions = proposal.descriptions or {}
+    total = 0.0
+    growth = 0.0
+    for ticker, weight in allocations.items():
+        try:
+            w = abs(float(weight))
+        except (TypeError, ValueError):
+            continue
+        total += w
+        if _classify_holding(ticker, descriptions.get(ticker, "")) == "growth":
+            growth += w
+    if total <= 0:
+        return 0.0
+    return growth / total
+
+
+# ---------------------------------------------------------------------------
+# Risk-factor budget (shared with the Evaluator's deterministic factor gate
+# in agents.py via ``factor_budget_violations``)
+# ---------------------------------------------------------------------------
+# Coarser than the growth/defensive split AND coarser than product category:
+# it collapses each macro risk factor's many wrappers into one bucket, because
+# daily returns are dominated by the FACTOR, not the wrapper.  The two buckets
+# below are the ones most prone to redundant "cousins" — instruments in
+# different product categories that nonetheless load the SAME factor (and so
+# run ~0.8-0.95 correlated):
+#   • _RATES_TICKERS — Treasuries (any maturity), IG corporate credit,
+#     aggregate bonds, munis.  IG credit / agg are ~90% duration in daily
+#     moves, so they are NOT independent of Treasuries.  (TIPS are the separate
+#     INFLATION factor; short-Tsy / T-bills are the separate CASH factor —
+#     neither is counted here.)
+#   • _EQUITY_TILT — equity-beta sleeves BEYOND the core US-broad + intl + EM
+#     trio: factor, dividend, small-cap, REIT, high-yield.  All ~0.8-0.95
+#     correlated with broad equity (→ ~1 in a crash), so they are tilts, not
+#     diversifiers.
+# The gate caps each bucket at ONE sleeve (see ``factor_budget_violations``);
+# the other factors (inflation, commodities, gold, trend, cash, the equity
+# core) are left to the Generator prompt's per-factor "one sleeve" guidance.
+_RATES_TICKERS: frozenset[str] = frozenset({
+    # intermediate treasuries
+    "IEF", "GOVT", "VGIT", "SCHR",
+    # long treasuries
+    "TLT", "EDV", "VGLT", "SPTL",
+    # investment-grade corporate credit (~ duration daily; NOT independent)
+    "LQD", "VCIT", "VCSH", "IGIB", "IGSB",
+    # US aggregate bonds (~ duration + a thin credit/MBS tilt)
+    "AGG", "BND", "SCHZ", "IUSB",
+    # municipal bonds (duration)
+    "MUB", "VTEB", "TFI", "SUB", "VWITX",
+})
+_EQUITY_TILT: frozenset[str] = frozenset({
+    # US large-cap factor tilts
+    "QUAL", "MTUM", "VLUE", "USMV", "SPHQ", "SPLV",
+    # US dividend tilts
+    "SCHD", "DGRO", "VYM", "HDV", "NOBL", "DVY", "VIG",
+    # US small-cap
+    "IWM", "VB", "IJR", "SCHA", "VTWO",
+    # US REITs (equity-beta sector tilt)
+    "VNQ", "IYR", "SCHH", "XLRE", "RWR",
+    # high-yield credit (equity-beta, especially in stress)
+    "HYG", "JNK", "USHY", "SHYG",
+})
+
+
+def _factor_bucket(ticker: str) -> str | None:
+    """
+    Map a ticker to a capped factor bucket — ``"rates"``, ``"equity_tilt"``,
+    or ``None`` (everything the gate does not cap: equity core / intl / EM,
+    TIPS, commodities, gold, trend, cash, and unknowns).  Matches the raw
+    ticker first, then its ``RISK_PROXY_MAP`` long-history proxy, so proxied
+    young ETFs resolve too.
+    """
+    t = (ticker or "").strip().upper()
+    if t in _RATES_TICKERS:
+        return "rates"
+    if t in _EQUITY_TILT:
+        return "equity_tilt"
+    proxy = RISK_PROXY_MAP.get(t)
+    if proxy is not None:
+        p = proxy.upper()
+        if p in _RATES_TICKERS:
+            return "rates"
+        if p in _EQUITY_TILT:
+            return "equity_tilt"
+    return None
+
+
+def factor_budget_violations(proposal: PortfolioProposal) -> list[str]:
+    """
+    Deterministic factor-budget check for the construction taxonomy.  Returns
+    a list of human-readable violation strings (empty list -> no violation).
+
+    Enforces the two caps the Generator prompt declares binding (see its
+    DIVERSIFICATION block):
+      • AT MOST ONE pure-rates sleeve (Treasuries / IG credit / agg / muni all
+        load the same duration factor),
+      • AT MOST ONE equity tilt beyond core US + intl + EM (factor / dividend /
+        small-cap / REIT / high-yield are all equity beta).
+
+    The Evaluator (in ``agents.py``) calls this and forces a QA FAIL on any
+    violation — like the growth-ceiling gate, it can only turn a pass into a
+    fail, never the reverse.  Positive-weight holdings only; classification is
+    via :func:`_factor_bucket` (raw ticker, then proxy), so unknown tickers are
+    simply ignored by this gate.
+    """
+    allocations = proposal.allocations or {}
+    rates: list[str] = []
+    tilts: list[str] = []
+    for ticker, weight in allocations.items():
+        try:
+            if float(weight) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        bucket = _factor_bucket(ticker)
+        if bucket == "rates":
+            rates.append(ticker)
+        elif bucket == "equity_tilt":
+            tilts.append(ticker)
+
+    violations: list[str] = []
+    if len(rates) > 1:
+        violations.append(
+            f"RATES/DURATION over-budget: {len(rates)} sleeves "
+            f"({', '.join(rates)}) all load the same duration factor "
+            f"(Treasuries / IG credit / aggregate / muni run ~0.8-0.95 "
+            f"correlated daily). Hold AT MOST ONE; TIPS and cash are separate "
+            f"factors and do not count here."
+        )
+    if len(tilts) > 1:
+        violations.append(
+            f"EQUITY-BETA over-budget: {len(tilts)} tilts ({', '.join(tilts)}) "
+            f"are all equity beta (factor / dividend / small-cap / REIT / "
+            f"high-yield run ~0.8-0.95 correlated with broad equity). Keep AT "
+            f"MOST ONE tilt beyond core US + intl + EM."
+        )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Horizon helpers
+# ---------------------------------------------------------------------------
+def posture_for_horizon(horizon_years: int) -> dict[str, Any]:
+    """
+    Resolve the glide-path posture for an OPTIMIZED-regime horizon
+    (``horizon_years >= HORIZON_FLOOR_YEARS``).
+
+    Returns ``{"label", "growth_ceiling", "band", "horizon_years"}`` — the
+    first band whose half-open ``[low, high)`` interval contains the
+    horizon.  Horizons at or above the last band's ``low`` land in that
+    final (open-ended) band.
+
+    Caller contract: only call this for ``horizon_years >= HORIZON_FLOOR_YEARS``
+    (the harness short-circuits below the floor before reaching here).
+    """
+    for band in HORIZON_GLIDE_PATH:
+        low = band["low"]
+        high = band["high"]
+        if horizon_years >= low and (high is None or horizon_years < high):
+            return {
+                "label": band["label"],
+                "growth_ceiling": band["growth_ceiling"],
+                "band": band["band"],
+                "horizon_years": horizon_years,
+            }
+    # Unreachable for horizon_years >= HORIZON_FLOOR_YEARS given the bands
+    # above start at 3, but fail-soft to the most conservative band.
+    first = HORIZON_GLIDE_PATH[0]
+    return {
+        "label": first["label"],
+        "growth_ceiling": first["growth_ceiling"],
+        "band": first["band"],
+        "horizon_years": horizon_years,
+    }
+
+
+def preservation_template(horizon_years: int) -> dict[str, float]:
+    """
+    Resolve the fixed capital-preservation allocation for a SHORT-circuit
+    horizon (``horizon_years < HORIZON_FLOOR_YEARS``).
+
+    ``horizon_years < 1`` -> the ``"<1y"`` template (pure T-bills);
+    ``1 <= horizon_years < 3`` -> the ``"1-3y"`` template (T-bills + short
+    Treasury + short TIPS).  Returns a fresh copy so callers can mutate
+    freely.
+    """
+    key = "<1y" if horizon_years < 1 else "1-3y"
+    return dict(PRESERVATION_TEMPLATES[key])
 
 
 def _refinement_improvements(
@@ -121,70 +498,14 @@ def _refinement_improvements(
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR — the harness loop
 # ---------------------------------------------------------------------------
-def _format_advisor_feedback(advisor_output: AdvisorOutput | None) -> str:
-    """
-    Format the Advisor's correlation findings as a concrete, actionable
-    block for the next Generator iteration's prompt.  Only pairs whose
-    absolute correlation is ≥ ``ADVISOR_FEEDBACK_RHO_THRESHOLD`` (default
-    0.7) are surfaced — below that we don't want to clutter the prompt
-    with marginal overlaps.
-
-    Returns "" when the Advisor is missing, found nothing actionable,
-    or wasn't run.
-    """
-    if advisor_output is None:
-        return ""
-    pairs = []
-    for p in (advisor_output.correlation_pairs or []):
-        try:
-            rho = float(p.get("rho", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if abs(rho) >= ADVISOR_FEEDBACK_RHO_THRESHOLD:
-            pairs.append((p.get("a", ""), p.get("b", ""), rho))
-    suggestions = advisor_output.suggestions or []
-    if not pairs and not suggestions:
-        return ""
-
-    lines: list[str] = [
-        "ADVISOR FINDINGS — OVERLAPPING HOLDINGS IN YOUR PREVIOUS PORTFOLIO:",
-        "",
-        (
-            f"The previous portfolio contains highly correlated holdings "
-            f"(|ρ| ≥ {ADVISOR_FEEDBACK_RHO_THRESHOLD:.2f}). Each pair "
-            f"represents redundant exposure — collapse each pair into "
-            f"ONE ticker in your next iteration."
-        ),
-        "",
-    ]
-    if pairs:
-        lines.append("Correlated pairs to consolidate:")
-        for a, b, rho in sorted(pairs, key=lambda x: -abs(x[2])):
-            lines.append(f"  • {a} ↔ {b}  (ρ ≈ {rho:+.2f})")
-        lines.append("")
-    if suggestions:
-        lines.append("Specific consolidation suggestions:")
-        for s in suggestions:
-            merge_from = " + ".join(s.get("merge_from") or []) or "(unspecified)"
-            merge_into = s.get("merge_into") or "(unspecified)"
-            tradeoff = s.get("tradeoff") or ""
-            line = f"  • Replace {merge_from} → {merge_into}"
-            if tradeoff:
-                line += f"  (tradeoff: {tradeoff})"
-            lines.append(line)
-        lines.append("")
-    return "\n".join(lines)
-
-
 def _build_feedback(
     evaluation: EvaluationResult,
     proposal: PortfolioProposal,
-    advisor_output: AdvisorOutput | None = None,
 ) -> str:
     """
     Produce the next round's feedback string based on the current evaluation.
 
-    Three regimes (selects the BASE feedback text):
+    Four regimes (selects the feedback text):
       • Failed QA              → pass the critique through unchanged (today's behaviour).
       • Passed but over target → tell the generator to bring drawdown down to
                                  ~TARGET_MAX_LOSS without sacrificing scores.
@@ -194,14 +515,6 @@ def _build_feedback(
                                  under) TARGET_MAX_LOSS.
       • Passed and near target → still ask for a refinement attempt — the
                                  selector will keep the best across iterations.
-
-    If ``advisor_output`` is provided, its concrete correlation-pair
-    findings (≥ ``ADVISOR_FEEDBACK_RHO_THRESHOLD``) are prepended to the
-    base feedback.  This converts the Advisor from a one-shot report
-    decoration into a real signal in the generator ↔ evaluator loop —
-    the Generator gets actual overlapping pairs to fix in the next
-    iteration, instead of a vague "avoid correlation" rule it cannot
-    apply (LLMs can't reliably estimate ρ from memory).
     """
     if not evaluation.passed:
         base = evaluation.critique
@@ -241,9 +554,6 @@ def _build_feedback(
                 f"{evaluation.critique}"
             )
 
-    advisor_section = _format_advisor_feedback(advisor_output)
-    if advisor_section:
-        return advisor_section + "\n" + base
     return base
 
 
@@ -275,50 +585,249 @@ def _select_best_iteration(history: list[dict]) -> int | None:
     return best["iteration"]
 
 
+def _run_preservation(
+    horizon_years: int,
+    *,
+    price: bool,
+    risk: bool,
+    correlation: bool,
+    capital: float,
+) -> dict[str, Any]:
+    """
+    Build the SHORT-circuit (capital-preservation) result for a sub-floor
+    horizon (``horizon_years < HORIZON_FLOOR_YEARS``).
+
+    NO LLM agents run here — not the Planner, Generator, Evaluator, or
+    Refiner.  We hand back the deterministic preservation template plus a
+    redirect message, then run the NO-LLM steps (pricing, risk profile, and
+    correlation snapshot) on the template's allocations so the user still
+    gets a feasibility check, a downside picture, and a correlation view.
+    The result dict mirrors the optimized-mode schema so every downstream
+    reader (report, server, viz) can consume it uniformly: stubs / skipped
+    blocks fill the LLM-only slots.
+    """
+    allocations = preservation_template(horizon_years)
+    band = "<1y" if horizon_years < 1 else "1-3y"
+    redirect = (
+        f"Horizon of {horizon_years} year(s) is below the {HORIZON_FLOOR_YEARS}-year "
+        f"floor for return optimisation. At this horizon, capital preservation "
+        f"dominates: there is not enough time to recover from a drawdown, so the "
+        f"optimizer is short-circuited and a fixed high-grade cash / short-bond "
+        f"template is returned instead. To have a portfolio optimised for return, "
+        f"use a horizon of at least {HORIZON_FLOOR_YEARS} years."
+    )
+    descriptions = {
+        "SGOV": "iShares 0-3 Month Treasury ETF — T-bills / cash equivalent",
+        "SHY":  "iShares 1-3 Year Treasury ETF — short-duration US government bonds",
+        "VTIP": "Vanguard Short-Term TIPS ETF — short inflation-protected Treasuries",
+    }
+    descriptions = {t: descriptions.get(t, "") for t in allocations}
+
+    print("\n" + "=" * 60)
+    print(f"PRESERVATION SHORT-CIRCUIT — horizon {horizon_years}y < "
+          f"{HORIZON_FLOOR_YEARS}y floor (no LLM agents run)")
+    print("=" * 60)
+    print(redirect + "\n")
+    for ticker, weight in allocations.items():
+        print(f"  {ticker:20s}  {weight:6.1%}")
+    print()
+
+    # final_proposal carries the template; expected_* are NULL — these are a
+    # deterministic template, not a modeled / optimised book, so any return /
+    # drawdown number would be fabricated.
+    final_proposal = PortfolioProposal(
+        allocations=allocations,
+        descriptions=descriptions,
+        expected_annual_return=None,
+        expected_max_drawdown=None,
+        methodology=(
+            "Deterministic capital-preservation template (no optimisation). "
+            "Selected by horizon band, not by the LLM pipeline."
+        ),
+        rationale=redirect,
+        raw_text="",
+    )
+    spec_stub = InvestmentSpec(
+        objective=(
+            f"Capital preservation over a {horizon_years}-year horizon "
+            f"(below the {HORIZON_FLOOR_YEARS}-year optimisation floor)."
+        ),
+        constraints="Preserve principal; no return optimisation at this horizon.",
+        asset_universe="High-grade Treasuries, short TIPS, T-bills / cash.",
+        risk_budget="Minimise drawdown; do not deploy growth-asset risk.",
+        evaluation_criteria="N/A — deterministic template, not LLM-evaluated.",
+        raw_text="",
+    )
+    final_evaluation_stub = EvaluationResult(
+        passed=True,
+        scores={},
+        average_score=0.0,
+        critique=(
+            "Not QA-evaluated: capital-preservation template returned "
+            "deterministically below the horizon floor."
+        ),
+        raw_text="",
+    )
+
+    # --- Pricing & risk are NO-LLM steps — run them on the template ---
+    pricing_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "capital": capital,
+        "total_invested": 0.0,
+        "leftover_cash": 0.0,
+        "max_abs_drift": 0.0,
+        "rows": [],
+        "failed_tickers": [],
+        "disclaimer": PRICING_DISCLAIMER,
+        "source": "yfinance",
+        "fetched_at": "",
+        "error": None,
+    }
+    if not price:
+        pricing_block["skipped_reason"] = "disabled via --no-prices / --test"
+    else:
+        pricing_result = run_pricing(allocations, capital)
+        pricing_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(pricing_result),
+        }
+
+    risk_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": RISK_DISCLAIMER,
+        "error": None,
+    }
+    if not risk:
+        risk_block["skipped_reason"] = "disabled via --no-risk / --test"
+    else:
+        risk_result = run_risk_profile(allocations, horizon_years=horizon_years)
+        risk_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(risk_result),
+        }
+
+    correlation_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": CORRELATION_DISCLAIMER,
+        "error": None,
+    }
+    if not correlation:
+        correlation_block["skipped_reason"] = "disabled via --no-correlation / --test"
+    else:
+        correlation_result = run_correlation(allocations)
+        correlation_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(correlation_result),
+        }
+
+    return {
+        "model": api.MODEL,
+        "max_iterations": MAX_ITERATIONS,
+        "pass_threshold": PASS_THRESHOLD,
+        "target_max_loss": TARGET_MAX_LOSS,
+        "mode": "preservation",
+        "horizon_years": horizon_years,
+        "horizon_posture": PRESERVATION_POSTURE,
+        "preservation_band": band,
+        "redirect_message": redirect,
+        "spec": asdict(spec_stub),
+        "final_proposal": asdict(final_proposal),
+        "final_evaluation": asdict(final_evaluation_stub),
+        "selected_iteration": None,
+        "selected_proposal": asdict(final_proposal),
+        "selected_evaluation": asdict(final_evaluation_stub),
+        "iteration_history": [],
+        "refinement": {
+            "performed": False,
+            "skipped_reason": "preservation short-circuit — no optimisation loop",
+            "promoted": False,
+            "refined_proposal": None,
+            "refined_evaluation": None,
+            "improvements": None,
+        },
+        "pricing": pricing_block,
+        "risk_profile": risk_block,
+        "correlation": correlation_block,
+    }
+
+
 def run_harness(
     user_goal: str,
     *,
     refine: bool = True,
-    advise: bool = True,
     price: bool = True,
     risk: bool = True,
+    correlation: bool = True,
     capital: float = DEFAULT_CAPITAL,
+    horizon_years: int = DEFAULT_HORIZON_YEARS,
 ) -> dict[str, Any]:
     """
     Main entry point.  Runs the full Planner → Generator ↔ Evaluator loop,
-    then (by default) a post-selection REFINER pass, an ADVISOR pass, and
-    a PRICING / lot-size feasibility pass.
+    then (by default) a post-selection REFINER pass, a PRICING / lot-size
+    feasibility pass, a Monte-Carlo RISK profile, and a no-LLM CORRELATION
+    snapshot.
 
     Flow:
       1. Planner expands the goal into a full investment spec.
       2. MAX_ITERATIONS rounds of Generator ↔ Evaluator.  Always runs
          all rounds; never breaks early.
       3. Select the best PASSING iteration whose expected_max_drawdown
-         is closest to TARGET_MAX_LOSS.  Falls back to the last iteration
+         is closest to TARGET_MAX_LOSS.  Falls back to the first iteration
          if nothing passed.
       4. If `refine=True`, run a single Refiner pass on the selected
          portfolio: Refiner addresses every critique point, then the
          Evaluator re-scores.  If the refined version passes QA, it is
          PROMOTED to `final_proposal`; otherwise the selected one stays
          as the final answer.
-      5. If `advise=True`, run a single ADVISOR pass on the final
-         portfolio.  The Advisor is read-only — it never modifies the
-         portfolio.  It returns a pairwise correlation snapshot and a
-         list of structured "merge X+Y into Z" suggestions with explicit
-         trade-offs, so the human reader can decide whether to apply any.
-      6. If `price=True`, fetch the latest price for each ticker in the
+      5. If `price=True`, fetch the latest price for each ticker in the
          final portfolio via yfinance and compute a whole-share lot-size
          feasibility check against `capital` USD.  Per-ticker failures
          (unknown ticker, network blip, model-invented pseudo-ticker) are
          recorded gracefully and never abort the pipeline.
-      7. If `risk=True`, build a Monte-Carlo return-distribution profile
+      6. If `risk=True`, build a Monte-Carlo return-distribution profile
          (block-bootstrap of historical returns, long-history asset-class
          proxies for young ETFs) reporting median outcome / chance of
          ending down / unlucky tails over several holding horizons.  Also
          yfinance-backed and fail-soft.
+      7. If `correlation=True`, compute a pairwise daily-return correlation
+         snapshot (yfinance, no LLM) on the final portfolio, flagging
+         highly redundant holdings (|ρ| >= 0.85).  Fail-soft.
+
+    HORIZON (Phase 2):
+      ``horizon_years`` is risk *capacity*.  Below ``HORIZON_FLOOR_YEARS``
+      the whole optimisation loop is short-circuited to a deterministic
+      capital-preservation template (mode="preservation", NO LLM agents).
+      At or above the floor (mode="optimized") the glide-path posture for
+      the horizon is computed deterministically, injected into the Planner
+      as a growth-asset ceiling, and enforced by the Evaluator's
+      deterministic ceiling check.  ``DEFAULT_HORIZON_YEARS`` (10) lands in
+      the topmost band and reproduces today's output.
     """
-    # --- Step 1: Plan ---
-    spec = run_planner(user_goal)
+    # --- Horizon gate: short-circuit below the floor (no LLM agents) ---
+    if horizon_years < HORIZON_FLOOR_YEARS:
+        return _run_preservation(
+            horizon_years,
+            price=price, risk=risk, correlation=correlation, capital=capital,
+        )
+
+    # --- Optimized regime: derive the glide-path posture deterministically ---
+    posture = posture_for_horizon(horizon_years)
+    growth_ceiling = posture["growth_ceiling"]
+    print("\n" + "=" * 60)
+    print(
+        f"HORIZON {horizon_years}y → posture '{posture['label']}' "
+        f"(band {posture['band']}, growth ceiling {growth_ceiling:.0%})"
+    )
+    print("=" * 60)
+
+    # --- Step 1: Plan (horizon-aware via the injected INVESTOR PROFILE) ---
+    spec = run_planner(user_goal, horizon_years=horizon_years, posture=posture)
 
     history: list[dict] = []
     proposals: list[PortfolioProposal] = []
@@ -335,33 +844,11 @@ def run_harness(
         evaluation = run_evaluator(
             spec, proposal,
             pass_threshold=PASS_THRESHOLD, max_loss=TARGET_MAX_LOSS,
+            growth_ceiling=growth_ceiling,
         )
 
         proposals.append(proposal)
         evaluations.append(evaluation)
-
-        # --- Step 3a: Intra-iteration Advisor (feedback signal) ---
-        # Run the Advisor on this iteration's portfolio so the next
-        # round's Generator prompt gets CONCRETE correlation pairs to
-        # collapse, rather than a vague "avoid overlap" rule that the
-        # LLM cannot apply.  Skip on the last iteration (no next round),
-        # when advise is disabled, or when the proposal produced no
-        # allocations.  The final Advisor pass (Step 6) still runs for
-        # the report and may see a different portfolio.
-        # None ⇒ didn't run; int (including 0) ⇒ ran and fed N pairs forward
-        intra_advisor: AdvisorOutput | None = None
-        intra_pairs_count: int | None = None
-        if (
-            advise
-            and i < MAX_ITERATIONS
-            and proposal.allocations
-        ):
-            intra_advisor = run_advisor(proposal)
-            intra_pairs_count = sum(
-                1 for p in (intra_advisor.correlation_pairs or [])
-                if abs(float(p.get("rho", 0) or 0))
-                   >= ADVISOR_FEEDBACK_RHO_THRESHOLD
-            )
 
         history.append({
             "iteration": i,
@@ -373,7 +860,6 @@ def run_harness(
             "average_score": evaluation.average_score,
             "passed": evaluation.passed,
             "critique_snippet": evaluation.critique[:300],
-            "intra_advisor_pairs_count": intra_pairs_count,
             "selected": False,
         })
 
@@ -383,12 +869,6 @@ def run_harness(
         print(f"  Passed              : {evaluation.passed}")
         print(f"  Expected max loss   : {proposal.expected_max_drawdown:.2%}")
         print(f"  Target max loss     : {TARGET_MAX_LOSS:.0%}")
-        if intra_advisor is not None:
-            print(
-                f"  Advisor (pre-feedback) flagged {intra_pairs_count} "
-                f"pair(s) at |ρ| ≥ {ADVISOR_FEEDBACK_RHO_THRESHOLD:.2f} "
-                f"— feeding into iteration {i + 1}"
-            )
 
         if i == MAX_ITERATIONS:
             # No need to compute feedback after the last round.
@@ -405,9 +885,7 @@ def run_harness(
         else:
             print("❌  Failed QA — feeding critique back to generator.\n")
 
-        feedback = _build_feedback(
-            evaluation, proposal, advisor_output=intra_advisor,
-        )
+        feedback = _build_feedback(evaluation, proposal)
 
     # --- Step 4: Select the best passing iteration ---
     selected_idx = _select_best_iteration(history)
@@ -464,6 +942,7 @@ def run_harness(
         refined_evaluation = run_evaluator(
             spec, refined_proposal,
             pass_threshold=PASS_THRESHOLD, max_loss=TARGET_MAX_LOSS,
+            growth_ceiling=growth_ceiling,
         )
 
         print(f"\n--- Refinement result ---")
@@ -512,39 +991,7 @@ def run_harness(
                 f"Keeping selected iteration {selected_idx} as final.\n"
             )
 
-    # --- Step 6: Advisor (read-only, advisory only) ---
-    advisor_block: dict[str, Any] = {
-        "performed": False,
-        "skipped_reason": None,
-        "suggestions": [],
-        "correlation_pairs": [],
-        "notes": "",
-        "raw_text": "",
-    }
-    if not advise:
-        advisor_block["skipped_reason"] = "disabled via --no-advisor / --test"
-        print("\n(Advisor step skipped.)\n")
-    elif not final_proposal.allocations:
-        advisor_block["skipped_reason"] = "no allocations to advise on"
-        print("\n(Advisor step skipped — no allocations.)\n")
-    else:
-        advisor_output = run_advisor(final_proposal)
-        advisor_block.update({
-            "performed": True,
-            "suggestions": advisor_output.suggestions,
-            "correlation_pairs": advisor_output.correlation_pairs,
-            "notes": advisor_output.notes,
-            "raw_text": advisor_output.raw_text,
-        })
-        n_pairs = len(advisor_output.correlation_pairs)
-        n_sugg = len(advisor_output.suggestions)
-        print(
-            f"\n💡  Advisor returned {n_pairs} correlated pair(s) and "
-            f"{n_sugg} consolidation suggestion(s).  The portfolio was "
-            f"NOT modified — see the report for details.\n"
-        )
-
-    # --- Step 7: Pricing & lot-size feasibility (yfinance) ---
+    # --- Step 6: Pricing & lot-size feasibility (yfinance) ---
     pricing_block: dict[str, Any] = {
         "performed": False,
         "skipped_reason": None,
@@ -573,7 +1020,7 @@ def run_harness(
             **asdict(pricing_result),
         }
 
-    # --- Step 8: Return-distribution risk profile (yfinance + Monte-Carlo) ---
+    # --- Step 7: Return-distribution risk profile (yfinance + Monte-Carlo) ---
     risk_block: dict[str, Any] = {
         "performed": False,
         "skipped_reason": None,
@@ -587,11 +1034,32 @@ def run_harness(
         risk_block["skipped_reason"] = "no allocations to model"
         print("\n(Risk-profile step skipped — no allocations.)\n")
     else:
-        risk_result = run_risk_profile(final_proposal.allocations)
+        risk_result = run_risk_profile(final_proposal.allocations, horizon_years=horizon_years)
         risk_block = {
             "performed": True,
             "skipped_reason": None,
             **asdict(risk_result),
+        }
+
+    # --- Step 8: Pairwise-correlation snapshot (yfinance, no LLM) ---
+    correlation_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": CORRELATION_DISCLAIMER,
+        "error": None,
+    }
+    if not correlation:
+        correlation_block["skipped_reason"] = "disabled via --no-correlation / --test"
+        print("\n(Correlation step skipped.)\n")
+    elif not final_proposal.allocations:
+        correlation_block["skipped_reason"] = "no allocations to correlate"
+        print("\n(Correlation step skipped — no allocations.)\n")
+    else:
+        correlation_result = run_correlation(final_proposal.allocations)
+        correlation_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(correlation_result),
         }
 
     return {
@@ -599,6 +1067,9 @@ def run_harness(
         "max_iterations": MAX_ITERATIONS,
         "pass_threshold": PASS_THRESHOLD,
         "target_max_loss": TARGET_MAX_LOSS,
+        "mode": "optimized",
+        "horizon_years": horizon_years,
+        "horizon_posture": posture["label"],
         "spec": asdict(spec),
         "final_proposal": asdict(final_proposal),
         "final_evaluation": asdict(final_evaluation),
@@ -607,9 +1078,9 @@ def run_harness(
         "selected_evaluation": asdict(selected_evaluation),
         "iteration_history": history,
         "refinement": refinement_block,
-        "advisor": advisor_block,
         "pricing": pricing_block,
         "risk_profile": risk_block,
+        "correlation": correlation_block,
     }
 
 
@@ -633,6 +1104,7 @@ if __name__ == "__main__":
         "haiku":  "claude-haiku-4-5-20251001",
         "sonnet": "claude-sonnet-4-6",
         "opus":   "claude-opus-4-7",
+        "fable":  "claude-fable-5",
     }
 
     parser = argparse.ArgumentParser(
@@ -644,12 +1116,15 @@ if __name__ == "__main__":
               uv run python harness.py --test
               uv run python harness.py --model sonnet
               uv run python harness.py --model haiku --iterations 1
+              uv run python harness.py --reasoning-model fable
               uv run python harness.py --no-refine
-              uv run python harness.py --no-advisor
               uv run python harness.py --no-prices
               uv run python harness.py --no-risk
+              uv run python harness.py --no-correlation
               uv run python harness.py --capital 250000
               uv run python harness.py --max-loss 0.10
+              uv run python harness.py --horizon-years 5
+              uv run python harness.py --horizon-years 2
         """),
     )
     parser.add_argument(
@@ -665,8 +1140,22 @@ if __name__ == "__main__":
         "--model",
         metavar="MODEL",
         help=(
-            "Override the model. Accepts short aliases (haiku, sonnet, opus) or a "
-            "full Anthropic model ID. Ignored when --test is also set."
+            "Override the model for ALL agents. Accepts short aliases "
+            "(haiku, sonnet, opus, fable) or a full Anthropic model ID. "
+            "Ignored when --test is also set."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-model",
+        metavar="MODEL",
+        help=(
+            "Override the model for ONLY the heavy reasoning agents "
+            "(Generator / Evaluator / Refiner), leaving the Planner on its "
+            "own model. Same aliases as --model (haiku, sonnet, opus, fable) "
+            "or a full model ID. Use this to A/B a reasoning model "
+            "(e.g. --reasoning-model fable) without dragging the Planner into "
+            "it. Ignored under --test; if combined with --model, this wins "
+            "for the heavy agents."
         ),
     )
     parser.add_argument(
@@ -689,14 +1178,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--no-advisor",
+        "--no-correlation",
         action="store_true",
         help=(
-            "Skip the post-selection Advisor pass. By default, after the "
-            "final portfolio is determined, an Advisor agent produces a "
-            "pairwise correlation snapshot and concrete consolidation "
-            "suggestions (advisory only — never modifies the portfolio). "
-            "--test implies --no-advisor."
+            "Skip the post-selection Correlation snapshot. By default, after "
+            "the final portfolio is determined, a no-LLM step computes the "
+            "pairwise daily-return correlations of the holdings from Yahoo "
+            "Finance history and flags highly redundant pairs (|ρ| >= 0.85). "
+            "yfinance-backed and fail-soft. --test implies --no-correlation."
         ),
     )
     parser.add_argument(
@@ -738,6 +1227,22 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--horizon-years",
+        type=int,
+        default=DEFAULT_HORIZON_YEARS,
+        metavar="N",
+        help=(
+            f"Investment horizon in whole years (default {DEFAULT_HORIZON_YEARS}). "
+            f"Horizon is risk CAPACITY and binds independently of --max-loss "
+            f"(risk tolerance) — the more conservative of the two wins. At or "
+            f"above the {HORIZON_FLOOR_YEARS}-year floor the glide-path posture "
+            f"caps growth-asset weight (3-5y→50%%, 5-10y→75%%, 10y+→90%%) and the "
+            f"full pipeline runs. Below the floor the optimizer is short-circuited "
+            f"to a deterministic capital-preservation template (no LLM agents). "
+            f"Must be >= 1."
+        ),
+    )
+    parser.add_argument(
         "--capital",
         type=float,
         default=DEFAULT_CAPITAL,
@@ -750,11 +1255,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # --horizon-years validates in both --test and normal modes (it changes
+    # the recommended portfolio, not just a model/iteration knob).  Reject
+    # < 1 with a clear error; the run_harness floor handles the < 3 case.
+    if args.horizon_years < 1:
+        parser.error("--horizon-years must be >= 1 (whole years)")
+    horizon_years = args.horizon_years
+
     # Apply --test first (it takes precedence), then individual overrides.
     refine = not args.no_refine
-    advise = not args.no_advisor
     price = not args.no_prices
     risk = not args.no_risk
+    correlation = not args.no_correlation
     capital = args.capital
     if args.test:
         # --test forces ALL agents to haiku (and disables everything else).
@@ -762,15 +1274,15 @@ if __name__ == "__main__":
         # call_claude picks them up on the next call.
         api.MODEL = _MODEL_ALIASES["haiku"]
         api.PLANNER_MODEL = _MODEL_ALIASES["haiku"]
-        api.ADVISOR_MODEL = _MODEL_ALIASES["haiku"]
         MAX_ITERATIONS = 1
-        refine = False   # --test always implies --no-refine
-        advise = False   # --test always implies --no-advisor
-        price = False    # --test always implies --no-prices
-        risk = False     # --test always implies --no-risk
+        refine = False        # --test always implies --no-refine
+        price = False         # --test always implies --no-prices
+        risk = False          # --test always implies --no-risk
+        correlation = False   # --test always implies --no-correlation
         print(
             f"[TEST MODE] model={api.MODEL}  iterations={MAX_ITERATIONS}  "
-            f"refine={refine}  advise={advise}  price={price}  risk={risk}"
+            f"refine={refine}  price={price}  risk={risk}  "
+            f"correlation={correlation}"
         )
     else:
         if args.model:
@@ -780,14 +1292,25 @@ if __name__ == "__main__":
             resolved = _MODEL_ALIASES.get(args.model, args.model)
             api.MODEL = resolved
             api.PLANNER_MODEL = resolved
-            api.ADVISOR_MODEL = resolved
             print(f"[model override — all agents] {api.MODEL}")
         else:
             # No override — show the per-agent assignments so the user
             # knows the pipeline isn't uniform.
             print(
                 f"[per-agent models] generator/evaluator/refiner={api.MODEL}  "
-                f"planner={api.PLANNER_MODEL}  advisor={api.ADVISOR_MODEL}"
+                f"planner={api.PLANNER_MODEL}"
+            )
+        # --reasoning-model overrides ONLY the heavy agents (Generator /
+        # Evaluator / Refiner) by patching api.MODEL, leaving api.PLANNER_MODEL
+        # untouched — so a reasoning model (e.g. Fable 5) can be A/B'd without
+        # dragging the Planner into it.  Applied AFTER --model so it wins for
+        # the heavy agents.
+        if args.reasoning_model:
+            resolved_rm = _MODEL_ALIASES.get(args.reasoning_model, args.reasoning_model)
+            api.MODEL = resolved_rm
+            print(
+                f"[reasoning-model override — generator/evaluator/refiner] "
+                f"{api.MODEL}  (planner stays {api.PLANNER_MODEL})"
             )
         if args.iterations is not None:
             if args.iterations < 1:
@@ -798,14 +1321,14 @@ if __name__ == "__main__":
             parser.error("--capital must be > 0")
         if not refine:
             print("[refinement disabled]")
-        if not advise:
-            print("[advisor disabled]")
         if not price:
             print("[pricing disabled]")
         else:
             print(f"[pricing enabled  capital=${capital:,.0f}]")
         if not risk:
             print("[risk profile disabled]")
+        if not correlation:
+            print("[correlation disabled]")
 
     # --max-loss applies in both --test and normal modes (orthogonal to
     # model / iteration overrides).  Patching TARGET_MAX_LOSS here means
@@ -829,13 +1352,16 @@ if __name__ == "__main__":
         "investor (stocks, ETFs, bonds, options overlays, etc.)."
     )
 
+    print(f"[horizon] {horizon_years} year(s)")
+
     result = run_harness(
         goal,
         refine=refine,
-        advise=advise,
         price=price,
         risk=risk,
+        correlation=correlation,
         capital=capital,
+        horizon_years=horizon_years,
     )
 
     # Dump full trace to a JSON file for inspection
@@ -848,18 +1374,31 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("FINAL PORTFOLIO")
     print("=" * 60)
-    sel = result.get("selected_iteration")
-    if sel is not None:
-        print(f"  Selected iteration : {sel} of {MAX_ITERATIONS} (best passing)")
+    mode = result.get("mode", "optimized")
+    print(f"  Mode               : {mode}")
+    print(
+        f"  Horizon            : {result.get('horizon_years')} year(s) "
+        f"— {result.get('horizon_posture')}"
+    )
+    if mode == "preservation":
+        print("  (Capital-preservation short-circuit — no optimisation loop ran.)")
     else:
-        print(f"  Selected iteration : last of {MAX_ITERATIONS} (no iteration passed)")
+        sel = result.get("selected_iteration")
+        if sel is not None:
+            print(f"  Selected iteration : {sel} of {MAX_ITERATIONS} (best passing)")
+        else:
+            print(f"  Selected iteration : last of {MAX_ITERATIONS} (no iteration passed)")
     print(f"  Target max loss    : {result['target_max_loss']:.1%}\n")
 
     if result["final_proposal"]:
         for ticker, weight in result["final_proposal"]["allocations"].items():
             print(f"  {ticker:20s}  {weight:6.1%}")
-        print(f"\n  Expected return    : {result['final_proposal']['expected_annual_return']:.1%}")
-        print(f"  Expected max loss  : {result['final_proposal']['expected_max_drawdown']:.1%}")
+        exp_ret = result["final_proposal"]["expected_annual_return"]
+        exp_dd = result["final_proposal"]["expected_max_drawdown"]
+        # Preservation mode leaves these NULL (a deterministic template, not
+        # a modeled book) — print "n/a" rather than crash on the format spec.
+        print(f"\n  Expected return    : {exp_ret:.1%}" if exp_ret is not None else "\n  Expected return    : n/a")
+        print(f"  Expected max loss  : {exp_dd:.1%}" if exp_dd is not None else "  Expected max loss  : n/a")
     print(f"\n  Passed QA          : {result['final_evaluation']['passed']}")
     print(f"  Final avg score    : {result['final_evaluation']['average_score']}")
 

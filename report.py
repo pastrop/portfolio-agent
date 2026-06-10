@@ -51,6 +51,380 @@ def _format_weight(w: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Pricing & risk sections — shared by the optimized and preservation reports.
+# Both are no-LLM steps, so they are populated in BOTH regimes; factoring
+# them out lets the preservation report reuse them verbatim.
+# ---------------------------------------------------------------------------
+def _push_pricing_section(push: Any, result: dict[str, Any]) -> None:
+    """Render the 'Latest Prices & Lot-Size Feasibility' section."""
+    pricing = result.get("pricing") or {}
+    if pricing.get("performed"):
+        push("## Latest Prices & Lot-Size Feasibility")
+        push("")
+        if pricing.get("disclaimer"):
+            push(f"> ⚠️ **Data source disclaimer.** {pricing['disclaimer']}")
+            push("")
+
+        cap = float(pricing.get("capital", 0) or 0)
+        total_inv = float(pricing.get("total_invested", 0) or 0)
+        leftover = float(pricing.get("leftover_cash", 0) or 0)
+        max_drift = float(pricing.get("max_abs_drift", 0) or 0)
+        fetched = pricing.get("fetched_at", "")
+        failed_tickers = pricing.get("failed_tickers") or []
+
+        push(f"- **Assumed capital:** ${cap:,.2f}")
+        push(f"- **Total invested (whole shares):** ${total_inv:,.2f}")
+        push(f"- **Leftover cash:** ${leftover:,.2f}")
+        push(f"- **Max |weight drift|:** {max_drift:.2%}")
+        if fetched:
+            push(f"- **Fetched at:** {fetched}")
+        if failed_tickers:
+            ft = ", ".join(f"`{t}`" for t in failed_tickers)
+            push(f"- **Unpriced tickers:** {ft}")
+        push("")
+
+        rows_p = pricing.get("rows") or []
+        if rows_p:
+            push("| Ticker | Price | Target W. | Target $ | Shares | "
+                 "Actual $ | Actual W. | Δ Weight | Status |")
+            push("|--------|------:|----------:|---------:|------:|"
+                 "---------:|----------:|---------:|--------|")
+            for r in rows_p:
+                ticker = r.get("ticker", "")
+                status = r.get("status", "ok")
+                weight = float(r.get("weight", 0) or 0)
+                target_d = float(r.get("target_dollars", 0) or 0)
+                if status == "ok":
+                    price_v = float(r.get("price", 0) or 0)
+                    shares_v = int(r.get("shares", 0) or 0)
+                    actual_d = float(r.get("actual_dollars", 0) or 0)
+                    actual_w = float(r.get("actual_weight", 0) or 0)
+                    drift = float(r.get("weight_drift", 0) or 0)
+                    sign = "+" if drift > 0 else ""
+                    push(
+                        f"| `{ticker}` | ${price_v:,.2f} | "
+                        f"{weight:.2%} | ${target_d:,.2f} | "
+                        f"{shares_v:,d} | ${actual_d:,.2f} | "
+                        f"{actual_w:.2%} | {sign}{drift:.2%} | ok |"
+                    )
+                else:
+                    err = r.get("error") or "unpriced"
+                    push(
+                        f"| `{ticker}` | — | {weight:.2%} | "
+                        f"${target_d:,.2f} | — | — | — | — | {err} |"
+                    )
+            push("")
+    elif pricing.get("skipped_reason"):
+        push("## Latest Prices & Lot-Size Feasibility")
+        push("")
+        push(f"_Pricing pass skipped — {pricing['skipped_reason']}._")
+        push("")
+    elif pricing.get("error"):
+        push("## Latest Prices & Lot-Size Feasibility")
+        push("")
+        push(f"_Pricing pass could not run — {pricing['error']}_")
+        push("")
+
+
+def _push_risk_section(push: Any, result: dict[str, Any]) -> None:
+    """Render the 'Return Distribution (Monte-Carlo)' section."""
+    risk = result.get("risk_profile") or {}
+    if risk.get("performed"):
+        push("## Return Distribution (Monte-Carlo)")
+        push("")
+        if risk.get("disclaimer"):
+            push(f"> ⚠️ **How to read this.** {risk['disclaimer']}")
+            push("")
+
+        start = risk.get("sample_start", "")
+        end = risk.get("sample_end", "")
+        years = risk.get("sample_years", 0) or 0
+        incl08 = risk.get("includes_2008")
+        cov = float(risk.get("coverage_weight", 0) or 0)
+        ann_r = float(risk.get("annualized_return", 0) or 0)
+        ann_v = float(risk.get("annualized_vol", 0) or 0)
+        limiting = risk.get("limiting_ticker")
+
+        push(
+            f"- **Sample window:** {start} → {end} (~{years:g}y), "
+            f"{'**includes** the 2008 crisis' if incl08 else '⚠️ **does NOT include** 2008'}"
+        )
+        if not incl08 and limiting:
+            push(
+                f"  - window limited by `{limiting}` (no long-history proxy); "
+                f"tail estimates are correspondingly benign"
+            )
+        push(f"- **Coverage:** {cov:.0%} of the book modeled "
+             f"(realized sample: {ann_r:.1%} return, {ann_v:.1%} volatility)")
+
+        subs = risk.get("proxy_substitutions") or []
+        if subs:
+            sub_str = ", ".join(
+                f"`{s.get('original')}`→`{s.get('proxy')}`" for s in subs
+            )
+            push(f"- **Long-history proxies used:** {sub_str}")
+        dropped = risk.get("dropped_tickers") or []
+        if dropped:
+            dr = ", ".join(f"`{t}`" for t in dropped)
+            push(
+                f"- **Excluded (not priceable, e.g. option overlays):** {dr} "
+                f"— their weight was renormalized away, so the modeled "
+                f"downside is *more conservative* than the hedged portfolio"
+            )
+        push("")
+
+        horizons = risk.get("horizons") or []
+        if horizons:
+            push("Invest a lump sum today, look again after each horizon — "
+                 "where your money lands:")
+            push("")
+            push("| Horizon | Median outcome | Chance of ending down | "
+                 "Bad case (1-in-20) | Severe case (1-in-100) |")
+            push("|---------|---------------:|----------------------:|"
+                 "-------------------:|-----------------------:|")
+            for hz in horizons:
+                yrs = hz.get("horizon_years", 0)
+                med = float(hz.get("median", 0) or 0)
+                pdn = float(hz.get("prob_end_down", 0) or 0)
+                bad = float(hz.get("bad_5th", 0) or 0)
+                sev = float(hz.get("severe_1st", 0) or 0)
+                push(
+                    f"| {yrs} year{'s' if yrs != 1 else ''} | {med:+.0%} | "
+                    f"{pdn:.0%} | {bad:+.0%} | {sev:+.0%} |"
+                )
+            push("")
+            push(
+                "_**Median outcome** = the typical (50/50) total return. "
+                "**Chance of ending down** = probability you finish with less "
+                "than you started. **Bad / Severe case** = the 1-in-20 and "
+                "1-in-100 unlucky finishes._"
+            )
+            push("")
+    elif risk.get("skipped_reason"):
+        push("## Return Distribution (Monte-Carlo)")
+        push("")
+        push(f"_Risk-profile pass skipped — {risk['skipped_reason']}._")
+        push("")
+    elif risk.get("error"):
+        push("## Return Distribution (Monte-Carlo)")
+        push("")
+        push(f"_Risk-profile pass could not run — {risk['error']}_")
+        push("")
+
+
+def _push_correlation_section(push: Any, result: dict[str, Any]) -> None:
+    """
+    Render the 'Correlation Snapshot (computed)' section.
+
+    This replaces the old Advisor agent's recalled-from-memory correlation
+    table: the numbers here are computed from real yfinance history (see
+    ``correlation.py``), so they are trustworthy where the Advisor's were
+    not (it systematically misjudged the cash / short-duration sleeve).
+    """
+    corr = result.get("correlation") or {}
+    if corr.get("performed"):
+        push("## Correlation Snapshot (computed)")
+        push("")
+        if corr.get("disclaimer"):
+            push(f"> ⚠️ **How to read this.** {corr['disclaimer']}")
+            push("")
+
+        start = corr.get("sample_start", "")
+        end = corr.get("sample_end", "")
+        win = corr.get("window_years", 0) or 0
+        cov = float(corr.get("coverage_weight", 0) or 0)
+        freq = corr.get("frequency", "daily")
+        high_thr = float(corr.get("high_threshold", 0.85) or 0.85)
+        rep_thr = float(corr.get("report_threshold", 0.5) or 0.5)
+
+        push(f"- **Sample window:** {start} → {end} (~{win:g}y {freq} returns)")
+        push(f"- **Coverage:** {cov:.0%} of the book priced")
+        dropped = corr.get("dropped_tickers") or []
+        if dropped:
+            dr = ", ".join(f"`{t}`" for t in dropped)
+            push(
+                f"- **Excluded (no priceable history, e.g. option overlays):** "
+                f"{dr}"
+            )
+        push("")
+
+        pairs = corr.get("pairs") or []
+        high_n = int(corr.get("high_pairs_count", 0) or 0)
+        if pairs:
+            push(
+                f"Pairs with |ρ| ≥ {rep_thr:.2f} shown, strongest first. "
+                f"**{high_n}** pair(s) at |ρ| ≥ {high_thr:.2f} are flagged as "
+                f"highly redundant (⚠)."
+            )
+            push("")
+            push("| Ticker A | Ticker B | ρ | |")
+            push("|----------|----------|---:|:--|")
+            for p in pairs:
+                try:
+                    rho_s = f"{float(p.get('rho', 0)):+.2f}"
+                except (TypeError, ValueError):
+                    rho_s = str(p.get("rho", ""))
+                flag = " ⚠ high" if p.get("high") else ""
+                push(
+                    f"| `{p.get('a', '')}` | `{p.get('b', '')}` | "
+                    f"{rho_s} |{flag} |"
+                )
+            push("")
+        else:
+            push(
+                f"_No pairs at |ρ| ≥ {rep_thr:.2f} — the holdings are well "
+                f"diversified by this measure._"
+            )
+            push("")
+    elif corr.get("skipped_reason"):
+        push("## Correlation Snapshot (computed)")
+        push("")
+        push(f"_Correlation pass skipped — {corr['skipped_reason']}._")
+        push("")
+    elif corr.get("error"):
+        push("## Correlation Snapshot (computed)")
+        push("")
+        push(f"_Correlation pass could not run — {corr['error']}_")
+        push("")
+
+
+# ---------------------------------------------------------------------------
+# Horizon / posture header line (shared by both regimes)
+# ---------------------------------------------------------------------------
+def _push_horizon_header(push: Any, horizon_years: Any, horizon_posture: Any) -> None:
+    """
+    Emit the one-line horizon/posture header bullet, if the result dict
+    carries the Phase 2 keys.  Pre-Phase-2 traces lack both fields, in
+    which case we stay silent rather than print a misleading default —
+    the rest of the report renders exactly as it did before.
+    """
+    if horizon_years is None and horizon_posture is None:
+        return
+    parts: list[str] = []
+    if horizon_years is not None:
+        try:
+            yrs = int(horizon_years)
+            parts.append(f"{yrs} year{'s' if yrs != 1 else ''}")
+        except (TypeError, ValueError):
+            parts.append(str(horizon_years))
+    if horizon_posture:
+        parts.append(f"posture: {horizon_posture}")
+    push(f"- **Investment horizon:** {' — '.join(parts)}")
+
+
+# ---------------------------------------------------------------------------
+# Preservation short-circuit report (<3y, no LLM agents ran)
+# ---------------------------------------------------------------------------
+def _write_preservation_report(result: dict[str, Any], path: str) -> None:
+    """
+    Render the capital-preservation story for a ``mode == "preservation"``
+    run.  Under the 3-year floor the optimizer is intentionally bypassed:
+    no Planner/Generator/Evaluator/Refiner ran, so the usual iteration /
+    refinement sections would be empty shells.  We skip them entirely and
+    instead show:
+
+      * a banner explaining the short-circuit,
+      * the redirect message (why the optimizer was not run),
+      * the deterministic template allocation table, and
+      * the (no-LLM) pricing, risk-profile, and correlation sections.
+
+    ``final_proposal.expected_annual_return`` / ``expected_max_drawdown``
+    are ``None`` in this regime, so every numeric format here guards
+    against missing/None values.
+    """
+    final_p = result.get("final_proposal") or {}
+    model = result.get("model", _FALLBACK_MODEL)
+    horizon_years = result.get("horizon_years")
+    horizon_posture = result.get("horizon_posture")
+    band = result.get("preservation_band")
+    redirect = result.get("redirect_message")
+
+    out: list[str] = []
+    push = out.append
+
+    # ---- Header ----
+    push("# Portfolio Optimization Harness — Report")
+    push("")
+    push(f"- **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    push(f"- **Model:** `{model}` _(no LLM agents were invoked for this run)_")
+    _push_horizon_header(push, horizon_years, horizon_posture)
+    push(f"- **Mode:** capital preservation (short-circuit)")
+    if band:
+        push(f"- **Preservation band:** {band}")
+    push("")
+
+    # ---- Preservation banner ----
+    push("## ⚓ Capital-Preservation Short-Circuit")
+    push("")
+    push(
+        "This run fell **below the 3-year horizon floor**, so the "
+        "optimization pipeline was intentionally **not run**.  At horizons "
+        "this short, risk *capacity* — not risk *tolerance* — is the "
+        "binding constraint: there is too little time to recover from a "
+        "drawdown, so the harness returns a fixed, deterministic "
+        "capital-preservation template instead of an optimized portfolio."
+    )
+    push("")
+    if redirect:
+        push("> " + redirect.strip().replace("\n", "\n> "))
+        push("")
+
+    # ---- Template allocation ----
+    push("## Capital-Preservation Allocation (template)")
+    push("")
+    allocs = final_p.get("allocations") or {}
+    descs = final_p.get("descriptions") or {}
+    if allocs:
+        if descs:
+            push("| Ticker | Weight | Description |")
+            push("|--------|-------:|-------------|")
+            for ticker, weight in allocs.items():
+                desc = descs.get(ticker, "")
+                push(f"| `{ticker}` | {_format_weight(weight)} | {desc} |")
+        else:
+            push("| Ticker | Weight |")
+            push("|--------|-------:|")
+            for ticker, weight in allocs.items():
+                push(f"| `{ticker}` | {_format_weight(weight)} |")
+        push("")
+    else:
+        push("_(No allocation present in result.)_")
+        push("")
+
+    # expected_* are None in preservation mode — surface them honestly
+    # rather than coercing to 0.00% (which would imply a modeled figure).
+    er = final_p.get("expected_annual_return")
+    dd = final_p.get("expected_max_drawdown")
+    er_s = _format_weight(er) if er is not None else "_(not modeled)_"
+    dd_s = _format_weight(dd) if dd is not None else "_(not modeled)_"
+    push(f"- **Expected annual return:** {er_s}")
+    push(f"- **Expected max drawdown:** {dd_s}")
+    push("")
+    if final_p.get("methodology"):
+        push("### Methodology")
+        push("")
+        push(_format_value(final_p["methodology"]))
+        push("")
+    if final_p.get("rationale"):
+        push("### Rationale")
+        push("")
+        push(_format_value(final_p["rationale"]))
+        push("")
+
+    # ---- Pricing & lot-size feasibility (no-LLM step, populated) ----
+    _push_pricing_section(push, result)
+
+    # ---- Return distribution (Monte-Carlo risk profile, no-LLM step) ----
+    _push_risk_section(push, result)
+
+    # ---- Correlation snapshot (no-LLM step, populated) ----
+    _push_correlation_section(push, result)
+
+    with open(path, "w") as f:
+        f.write("\n".join(out))
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 def write_markdown_report(result: dict[str, Any], path: str) -> None:
@@ -71,6 +445,23 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
     refinement = result.get("refinement") or {}
     refined_promoted = bool(refinement.get("promoted"))
 
+    # Phase 2 horizon-awareness. A result dict that pre-dates Phase 2 has
+    # no `mode` key; per the locked spec a missing mode is treated as
+    # "optimized" for back-compat. `horizon_years` / `horizon_posture` are
+    # self-describing echoes — absent on old traces, so guard with None.
+    mode = result.get("mode", "optimized")
+    horizon_years = result.get("horizon_years")
+    horizon_posture = result.get("horizon_posture")
+
+    # ---- Preservation short-circuit (<3y) ----
+    # In preservation mode NO LLM agents ran: iteration_history and refinement
+    # are empty/skipped stubs, so we render a dedicated story (banner +
+    # redirect + template table + pricing + risk + correlation) and return —
+    # we deliberately do NOT fall through to the empty optimization shells.
+    if mode == "preservation":
+        _write_preservation_report(result, path)
+        return
+
     out: list[str] = []
     push = out.append
 
@@ -79,6 +470,7 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
     push("")
     push(f"- **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     push(f"- **Model:** `{model}`")
+    _push_horizon_header(push, horizon_years, horizon_posture)
     push(f"- **Iterations run:** {len(history)} of {max_iters}")
     if sel is not None:
         push(f"- **Selected iteration:** {sel} — best passing portfolio, closest to {target:.1%} target")
@@ -103,16 +495,16 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push("- **Refinement:** performed — refined version NOT promoted (kept selected as final)")
     elif refinement.get("skipped_reason"):
         push(f"- **Refinement:** skipped ({refinement['skipped_reason']})")
-    advisor_hdr = result.get("advisor") or {}
-    if advisor_hdr.get("performed"):
-        n_sugg = len(advisor_hdr.get("suggestions") or [])
-        n_pairs = len(advisor_hdr.get("correlation_pairs") or [])
+    correlation_hdr = result.get("correlation") or {}
+    if correlation_hdr.get("performed"):
+        n_pairs = len(correlation_hdr.get("pairs") or [])
+        n_high = int(correlation_hdr.get("high_pairs_count", 0) or 0)
         push(
-            f"- **Advisor:** performed — {n_sugg} consolidation "
-            f"suggestion(s), {n_pairs} correlated pair(s) (advisory only)"
+            f"- **Correlation:** computed — {n_pairs} pair(s) at |ρ| ≥ 0.5, "
+            f"{n_high} highly redundant (|ρ| ≥ 0.85)"
         )
-    elif advisor_hdr.get("skipped_reason"):
-        push(f"- **Advisor:** skipped ({advisor_hdr['skipped_reason']})")
+    elif correlation_hdr.get("skipped_reason"):
+        push(f"- **Correlation:** skipped ({correlation_hdr['skipped_reason']})")
     pricing_hdr = result.get("pricing") or {}
     if pricing_hdr.get("performed"):
         n_failed = len(pricing_hdr.get("failed_tickers") or [])
@@ -398,241 +790,14 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push("</details>")
             push("")
 
-    # ---- Advisor (simplification suggestions + correlation snapshot) ----
-    advisor = result.get("advisor") or {}
-    if advisor.get("performed"):
-        push("## Simplification Suggestions (advisory — not applied)")
-        push("")
-        push(
-            "The Advisor inspected the **final portfolio** and produced "
-            "the suggestions below.  These are advisory only — the "
-            "portfolio above has NOT been modified.  Decide which (if "
-            "any) to apply yourself."
-        )
-        push("")
-
-        suggestions = advisor.get("suggestions") or []
-        if suggestions:
-            for idx, s in enumerate(suggestions, start=1):
-                merge_from = s.get("merge_from") or []
-                merge_into = s.get("merge_into") or ""
-                from_str = ", ".join(f"`{t}`" for t in merge_from) or "_(none)_"
-                push(f"### Suggestion {idx}: {from_str} → `{merge_into}`")
-                push("")
-                if s.get("rationale"):
-                    push(f"- **Why:** {s['rationale']}")
-                if s.get("tradeoff"):
-                    push(f"- **Tradeoff:** {s['tradeoff']}")
-                push("")
-        else:
-            push("_The Advisor did not propose any consolidations — the "
-                 "portfolio is already well-organised by this measure._")
-            push("")
-
-        pairs = advisor.get("correlation_pairs") or []
-        if pairs:
-            push("### Correlation snapshot")
-            push("")
-            push(
-                "Approximate long-run correlations (model-recalled, not "
-                "computed).  Pairs with |ρ| ≥ 0.5 are shown; sorted by "
-                "strongest first."
-            )
-            push("")
-            push("| Ticker A | Ticker B | ρ | Note |")
-            push("|----------|----------|---:|------|")
-            try:
-                pairs_sorted = sorted(
-                    pairs,
-                    key=lambda p: -abs(float(p.get("rho", 0))),
-                )
-            except (TypeError, ValueError):
-                pairs_sorted = pairs
-            for p in pairs_sorted:
-                try:
-                    rho = float(p.get("rho", 0))
-                    rho_s = f"{rho:+.2f}"
-                except (TypeError, ValueError):
-                    rho_s = str(p.get("rho", ""))
-                push(
-                    f"| `{p.get('a', '')}` | `{p.get('b', '')}` | "
-                    f"{rho_s} | {p.get('note', '') or ''} |"
-                )
-            push("")
-
-        if advisor.get("notes"):
-            push("### Advisor notes")
-            push("")
-            push(_format_value(advisor["notes"]))
-            push("")
-
-        if advisor.get("raw_text"):
-            push("<details><summary>Advisor raw response</summary>")
-            push("")
-            push("```")
-            push(advisor["raw_text"].rstrip())
-            push("```")
-            push("")
-            push("</details>")
-            push("")
-    elif advisor.get("skipped_reason"):
-        push("## Simplification Suggestions (advisory)")
-        push("")
-        push(f"_Advisor pass skipped — {advisor['skipped_reason']}._")
-        push("")
-
     # ---- Pricing & lot-size feasibility ----
-    pricing = result.get("pricing") or {}
-    if pricing.get("performed"):
-        push("## Latest Prices & Lot-Size Feasibility")
-        push("")
-        if pricing.get("disclaimer"):
-            push(f"> ⚠️ **Data source disclaimer.** {pricing['disclaimer']}")
-            push("")
-
-        cap = float(pricing.get("capital", 0) or 0)
-        total_inv = float(pricing.get("total_invested", 0) or 0)
-        leftover = float(pricing.get("leftover_cash", 0) or 0)
-        max_drift = float(pricing.get("max_abs_drift", 0) or 0)
-        fetched = pricing.get("fetched_at", "")
-        failed_tickers = pricing.get("failed_tickers") or []
-
-        push(f"- **Assumed capital:** ${cap:,.2f}")
-        push(f"- **Total invested (whole shares):** ${total_inv:,.2f}")
-        push(f"- **Leftover cash:** ${leftover:,.2f}")
-        push(f"- **Max |weight drift|:** {max_drift:.2%}")
-        if fetched:
-            push(f"- **Fetched at:** {fetched}")
-        if failed_tickers:
-            ft = ", ".join(f"`{t}`" for t in failed_tickers)
-            push(f"- **Unpriced tickers:** {ft}")
-        push("")
-
-        rows_p = pricing.get("rows") or []
-        if rows_p:
-            push("| Ticker | Price | Target W. | Target $ | Shares | "
-                 "Actual $ | Actual W. | Δ Weight | Status |")
-            push("|--------|------:|----------:|---------:|------:|"
-                 "---------:|----------:|---------:|--------|")
-            for r in rows_p:
-                ticker = r.get("ticker", "")
-                status = r.get("status", "ok")
-                weight = float(r.get("weight", 0) or 0)
-                target_d = float(r.get("target_dollars", 0) or 0)
-                if status == "ok":
-                    price_v = float(r.get("price", 0) or 0)
-                    shares_v = int(r.get("shares", 0) or 0)
-                    actual_d = float(r.get("actual_dollars", 0) or 0)
-                    actual_w = float(r.get("actual_weight", 0) or 0)
-                    drift = float(r.get("weight_drift", 0) or 0)
-                    sign = "+" if drift > 0 else ""
-                    push(
-                        f"| `{ticker}` | ${price_v:,.2f} | "
-                        f"{weight:.2%} | ${target_d:,.2f} | "
-                        f"{shares_v:,d} | ${actual_d:,.2f} | "
-                        f"{actual_w:.2%} | {sign}{drift:.2%} | ok |"
-                    )
-                else:
-                    err = r.get("error") or "unpriced"
-                    push(
-                        f"| `{ticker}` | — | {weight:.2%} | "
-                        f"${target_d:,.2f} | — | — | — | — | {err} |"
-                    )
-            push("")
-    elif pricing.get("skipped_reason"):
-        push("## Latest Prices & Lot-Size Feasibility")
-        push("")
-        push(f"_Pricing pass skipped — {pricing['skipped_reason']}._")
-        push("")
-    elif pricing.get("error"):
-        push("## Latest Prices & Lot-Size Feasibility")
-        push("")
-        push(f"_Pricing pass could not run — {pricing['error']}_")
-        push("")
+    _push_pricing_section(push, result)
 
     # ---- Return distribution (Monte-Carlo risk profile) ----
-    risk = result.get("risk_profile") or {}
-    if risk.get("performed"):
-        push("## Return Distribution (Monte-Carlo)")
-        push("")
-        if risk.get("disclaimer"):
-            push(f"> ⚠️ **How to read this.** {risk['disclaimer']}")
-            push("")
+    _push_risk_section(push, result)
 
-        start = risk.get("sample_start", "")
-        end = risk.get("sample_end", "")
-        years = risk.get("sample_years", 0) or 0
-        incl08 = risk.get("includes_2008")
-        cov = float(risk.get("coverage_weight", 0) or 0)
-        ann_r = float(risk.get("annualized_return", 0) or 0)
-        ann_v = float(risk.get("annualized_vol", 0) or 0)
-        limiting = risk.get("limiting_ticker")
-
-        push(
-            f"- **Sample window:** {start} → {end} (~{years:g}y), "
-            f"{'**includes** the 2008 crisis' if incl08 else '⚠️ **does NOT include** 2008'}"
-        )
-        if not incl08 and limiting:
-            push(
-                f"  - window limited by `{limiting}` (no long-history proxy); "
-                f"tail estimates are correspondingly benign"
-            )
-        push(f"- **Coverage:** {cov:.0%} of the book modeled "
-             f"(realized sample: {ann_r:.1%} return, {ann_v:.1%} volatility)")
-
-        subs = risk.get("proxy_substitutions") or []
-        if subs:
-            sub_str = ", ".join(
-                f"`{s.get('original')}`→`{s.get('proxy')}`" for s in subs
-            )
-            push(f"- **Long-history proxies used:** {sub_str}")
-        dropped = risk.get("dropped_tickers") or []
-        if dropped:
-            dr = ", ".join(f"`{t}`" for t in dropped)
-            push(
-                f"- **Excluded (not priceable, e.g. option overlays):** {dr} "
-                f"— their weight was renormalized away, so the modeled "
-                f"downside is *more conservative* than the hedged portfolio"
-            )
-        push("")
-
-        horizons = risk.get("horizons") or []
-        if horizons:
-            push("Invest a lump sum today, look again after each horizon — "
-                 "where your money lands:")
-            push("")
-            push("| Horizon | Median outcome | Chance of ending down | "
-                 "Bad case (1-in-20) | Severe case (1-in-100) |")
-            push("|---------|---------------:|----------------------:|"
-                 "-------------------:|-----------------------:|")
-            for hz in horizons:
-                yrs = hz.get("horizon_years", 0)
-                med = float(hz.get("median", 0) or 0)
-                pdn = float(hz.get("prob_end_down", 0) or 0)
-                bad = float(hz.get("bad_5th", 0) or 0)
-                sev = float(hz.get("severe_1st", 0) or 0)
-                push(
-                    f"| {yrs} year{'s' if yrs != 1 else ''} | {med:+.0%} | "
-                    f"{pdn:.0%} | {bad:+.0%} | {sev:+.0%} |"
-                )
-            push("")
-            push(
-                "_**Median outcome** = the typical (50/50) total return. "
-                "**Chance of ending down** = probability you finish with less "
-                "than you started. **Bad / Severe case** = the 1-in-20 and "
-                "1-in-100 unlucky finishes._"
-            )
-            push("")
-    elif risk.get("skipped_reason"):
-        push("## Return Distribution (Monte-Carlo)")
-        push("")
-        push(f"_Risk-profile pass skipped — {risk['skipped_reason']}._")
-        push("")
-    elif risk.get("error"):
-        push("## Return Distribution (Monte-Carlo)")
-        push("")
-        push(f"_Risk-profile pass could not run — {risk['error']}_")
-        push("")
+    # ---- Correlation snapshot (computed, no LLM) ----
+    _push_correlation_section(push, result)
 
     # ---- Per-iteration detail ----
     push("## Iteration History (detailed)")
@@ -653,18 +818,6 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push(f"- **Average score:** {h.get('average_score')}")
             push(f"- **Expected return:** {h.get('expected_return')}")
             push(f"- **Expected max drawdown:** {h.get('expected_max_drawdown')}")
-        # Intra-iteration advisor pair count — evidence that the
-        # advisor-in-the-loop feedback signal was active for this round.
-        # Absent in older traces (key won't exist); a count of 0 also
-        # means "nothing actionable was fed forward" — show it either way
-        # so the loop's behavior is visible.
-        intra_n = h.get("intra_advisor_pairs_count")
-        if intra_n is not None:
-            next_iter = (h.get("iteration") or 0) + 1
-            push(
-                f"- **Advisor pairs fed to iteration {next_iter}:** "
-                f"{intra_n}"
-            )
         push("")
         scores_i = h.get("scores") or {}
         if scores_i:

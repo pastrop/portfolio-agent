@@ -18,6 +18,7 @@ MODEL_ALIASES: dict[str, str] = {
     "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-7",
+    "fable": "claude-fable-5",
 }
 
 
@@ -32,18 +33,30 @@ class RunRequest(BaseModel):
     model: Optional[str] = Field(
         None,
         description=(
-            "Override ALL three agent models. Aliases: 'haiku' | 'sonnet' "
-            "| 'opus', or a full Anthropic model ID. When omitted, the "
-            "per-agent defaults are used (Opus for Generator/Evaluator/"
-            "Refiner, Sonnet for Planner, Haiku for Advisor) — same as "
-            "running `python harness.py` with no flags."
+            "Override ALL agent models. Aliases: 'haiku' | 'sonnet' "
+            "| 'opus' | 'fable', or a full Anthropic model ID. When omitted, "
+            "the per-agent defaults are used (Opus for Generator/Evaluator/"
+            "Refiner, Sonnet for Planner) — same as running "
+            "`python harness.py` with no flags."
+        ),
+    )
+    reasoning_model: Optional[str] = Field(
+        None,
+        description=(
+            "Override the model for ONLY the heavy reasoning agents "
+            "(Generator / Evaluator / Refiner), leaving the Planner on its "
+            "own model. Same aliases as `model` ('haiku' | 'sonnet' | 'opus' "
+            "| 'fable') or a full model ID. Mirrors `--reasoning-model` on the "
+            "CLI — use it to A/B a reasoning model (e.g. 'fable') without "
+            "changing the Planner. Ignored when test=true; if combined with "
+            "`model`, this wins for the heavy agents."
         ),
     )
     test: bool = Field(
         False,
         description=(
             "Test mode: forces all agents to Haiku, 1 iteration, and "
-            "skips refine/advise/price.  Mirrors `--test` on the CLI."
+            "skips refine/price/risk/correlation.  Mirrors `--test` on the CLI."
         ),
     )
     iterations: Optional[int] = Field(
@@ -67,8 +80,22 @@ class RunRequest(BaseModel):
             "is used."
         ),
     )
+    horizon_years: int = Field(
+        10,
+        ge=1,
+        description=(
+            "Investment horizon in whole years. Mirrors `--horizon-years` "
+            "on the CLI (default DEFAULT_HORIZON_YEARS=10, so omitting it "
+            "reproduces today's output). Horizon = risk CAPACITY; it binds "
+            "independently of max_loss and the MORE CONSERVATIVE wins. "
+            ">=3y runs the full optimizer with a glide-path growth ceiling "
+            "injected into the Planner; <3y short-circuits to a "
+            "deterministic capital-preservation template (NO LLM agents "
+            "run). Unlike max_loss/iterations this is a plain run_harness "
+            "argument, not a patched global."
+        ),
+    )
     refine: bool = Field(True, description="Run the post-selection Refiner pass.")
-    advise: bool = Field(True, description="Run the Advisor passes (intra-loop + final).")
     price: bool = Field(True, description="Run the yfinance pricing / lot-size check.")
     risk: bool = Field(
         True,
@@ -76,6 +103,15 @@ class RunRequest(BaseModel):
             "Run the post-selection Monte-Carlo return-distribution profile "
             "(block-bootstrap with long-history proxies). Mirrors `--no-risk` "
             "on the CLI (set false to skip). Ignored when test=true."
+        ),
+    )
+    correlation: bool = Field(
+        True,
+        description=(
+            "Run the post-selection no-LLM pairwise-correlation snapshot "
+            "(daily-return correlations from yfinance, flags |ρ| >= 0.85). "
+            "Mirrors `--no-correlation` on the CLI (set false to skip). "
+            "Ignored when test=true."
         ),
     )
     capital: float = Field(
@@ -95,13 +131,31 @@ class RunCreated(BaseModel):
 
 
 class ResultSummary(BaseModel):
-    """Compact summary of a finished run.  Full trace is in the JSON artifact."""
+    """
+    Compact summary of a finished run.  Full trace is in the JSON artifact.
 
+    Phase 2: the summary is regime-aware.  In ``mode == "preservation"``
+    (horizon_years < 3) NO LLM agents run, so the optimizer-centric fields
+    (``selected_iteration``, ``final_average_score``, ``final_expected_*``)
+    are naturally null/zero and ``passed_qa`` is ``None`` rather than a
+    misleading ``true``/``false`` — the deterministic template was never
+    put through the Generator↔Evaluator QA loop.  ``annualized_return`` is
+    surfaced from the (no-LLM) Monte-Carlo risk profile so preservation
+    runs still report a meaningful expected return instead of a flat zero.
+    """
+
+    mode: Literal["optimized", "preservation"]
     selected_iteration: Optional[int]
     final_average_score: float
     final_expected_return: float
     final_expected_max_drawdown: float
-    passed_qa: bool
+    # Realized geometric annualized return from the Monte-Carlo risk
+    # profile (``risk_profile.annualized_return``).  None when the risk
+    # pass was skipped (e.g. test mode / risk=false).
+    annualized_return: Optional[float]
+    # None in preservation mode: the template never went through QA.  A
+    # bool only when an actual Evaluator pass/fail was produced.
+    passed_qa: Optional[bool]
 
 
 class JobView(BaseModel):

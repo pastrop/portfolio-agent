@@ -3,19 +3,19 @@ The five LLM agents for the Portfolio Optimization Harness.
 
 Each agent is a (SYSTEM prompt + ``run_*`` function) pair.  The
 orchestrator in ``harness.py`` composes them in the
-Planner → (Generator ↔ Evaluator) × N → Refiner → Re-evaluate →
-Advisor sequence; the Advisor is also run between iterations to feed
-its correlation findings back into the next round's Generator prompt.
+Planner → (Generator ↔ Evaluator) × N → Refiner → Re-evaluate
+sequence.  Pairwise-correlation reporting (formerly an LLM "Advisor"
+agent) is now a deterministic, no-LLM step in ``correlation.py``.
 
 Dependencies:
 * ``models`` for the dataclass return types (InvestmentSpec,
-  PortfolioProposal, EvaluationResult, AdvisorOutput)
+  PortfolioProposal, EvaluationResult)
 * ``api`` for the Anthropic client wrapper (``call_claude``) and the
   fail-soft JSON parser (``_parse_json_response``).  Per-agent model
-  selection (``api.PLANNER_MODEL``, ``api.ADVISOR_MODEL``) and the
-  Refiner's larger token budget (``api.REFINER_MAX_TOKENS``) are read
-  at call time via ``import api``, so CLI patches in ``harness.py``
-  take effect without any extra wiring.
+  selection (``api.PLANNER_MODEL``) and the Refiner's larger token
+  budget (``api.REFINER_MAX_TOKENS``) are read at call time via
+  ``import api``, so CLI patches in ``harness.py`` take effect without
+  any extra wiring.
 
 Orchestrator policy constants (``PASS_THRESHOLD``, ``MAX_ITERATIONS``)
 that affect agent behavior are accepted as keyword arguments rather
@@ -29,7 +29,6 @@ import textwrap
 import api
 from api import call_claude, _parse_json_response
 from models import (
-    AdvisorOutput,
     EvaluationResult,
     InvestmentSpec,
     PortfolioProposal,
@@ -99,13 +98,71 @@ PLANNER_SYSTEM = textwrap.dedent("""\
 """)
 
 
-def run_planner(user_goal: str) -> InvestmentSpec:
+def _investor_profile_block(horizon_years: int, posture: dict) -> str:
+    """
+    Render the horizon-aware INVESTOR PROFILE hard-constraint block injected
+    into the Planner's USER message (optimized regime, horizon >= 3y).
+
+    The harness derives the glide-path posture deterministically (label +
+    growth ceiling) and passes it in; this block translates it into an
+    explicit, machine-honoured constraint for the downstream construction
+    agents: cap GROWTH-asset weight (equity + REIT + commodity + high-yield)
+    at the ceiling, and fill the remainder with high-grade bonds / TIPS /
+    cash.  The Evaluator enforces the ceiling mechanically (see
+    ``run_evaluator``'s ``growth_ceiling`` check), so this is not a polite
+    suggestion — the spec must encode it as a binding constraint.
+    """
+    ceiling = posture["growth_ceiling"]
+    return textwrap.dedent(f"""\
+        INVESTOR PROFILE — HARD CONSTRAINTS (horizon-derived, binding):
+        • Investment horizon: {horizon_years} year(s).
+        • Risk posture: {posture['label']} (glide-path band {posture['band']}).
+        • GROWTH-ASSET CEILING: the combined weight of growth assets —
+          equity (US / international / EM / factor / dividend / small-cap),
+          REITs, broad commodities, gold, managed futures, and HIGH-YIELD
+          credit — MUST NOT exceed {ceiling:.0%} of the portfolio.
+        • The REMAINDER (at least {1 - ceiling:.0%}) MUST be high-grade
+          defensive assets: investment-grade / Treasury / aggregate bonds,
+          TIPS / inflation-linked, and cash / T-bills.
+        • The max annual loss budget still applies INDEPENDENTLY: keep the
+          portfolio within its stated max-loss constraint AND under this
+          growth ceiling — whichever binds tighter wins.
+        Bake these limits into the spec's `constraints` and `risk_budget`
+        fields as explicit, numeric rules so the construction engine can
+        honour them.
+    """)
+
+
+def run_planner(
+    user_goal: str,
+    *,
+    horizon_years: int = 10,
+    posture: dict | None = None,
+) -> InvestmentSpec:
+    """
+    Expand the user goal into a full investment spec.
+
+    When ``posture`` is provided (the harness's deterministic glide-path
+    result for ``horizon_years``), an INVESTOR PROFILE hard-constraint block
+    is prepended to the Planner's USER message so the spec encodes the
+    horizon-derived growth-asset ceiling.  When ``posture`` is None the
+    behaviour is byte-identical to the pre-horizon Planner (back-compat for
+    any caller that does not pass a posture).
+    """
     print("\n" + "=" * 60)
     print("PLANNER — expanding user goal into investment spec …")
     print("=" * 60)
 
+    user_msg = user_goal
+    if posture is not None:
+        user_msg = (
+            _investor_profile_block(horizon_years, posture)
+            + "\n"
+            + user_goal
+        )
+
     raw = call_claude(
-        PLANNER_SYSTEM, user_goal,
+        PLANNER_SYSTEM, user_msg,
         model=api.PLANNER_MODEL,
         max_tokens=api.PLANNER_MAX_TOKENS,   # spec + web_search needs >4096
         tools=_PLANNER_TOOLS,                # web_search (server-side)
@@ -154,47 +211,52 @@ _GENERATOR_SYSTEM_TEMPLATE = textwrap.dedent("""\
     {MAX_LOSS}, raise the return profile by deploying more risk-bearing exposure
     until your drawdown is near (but under) {MAX_LOSS}.
 
-    DIVERSIFICATION — IMPORTANT:
-    The portfolio must be diversified across genuinely independent risk
-    factors, not just across many tickers.  LLMs cannot reliably estimate
-    pairwise correlations from memory, so DO NOT try.  Instead, use this
-    explicit rule:
+    DIVERSIFICATION — BUDGET BY RISK FACTOR, NOT BY PRODUCT LABEL:
+    A portfolio is diversified when its risk is spread across factors that
+    pay off in DIFFERENT regimes — NOT when it holds many tickers.  Many
+    products that look distinct share ONE factor and move together (often
+    rho > 0.9), which buys you no diversification.  You cannot reliably
+    estimate correlations from memory, so DO NOT try — budget by the factor
+    map below and respect its caps instead.
 
-        From each overlap group below, choose AT MOST ONE ticker.
+        FACTOR            ROLE / WHEN IT HELPS          INSTRUMENTS (any one fills the factor)
+        Equity beta       growth; the return engine     US broad / factor / dividend / small-cap,
+                                                         intl developed, EM, REITs, high-yield credit
+        Rates / duration  ballast in a GROWTH shock     Treasuries (any maturity), IG corporate
+                                                         credit, aggregate bonds, munis
+        Inflation         ballast in an INFLATION shock TIPS
+        Commodities       supply / energy shock         broad commodities
+        Gold              monetary / geopolitical tail  gold
+        Trend             crisis trend-following        managed futures
+        Cash              liquidity, ~0 duration        T-bills / 0-3 month
 
-        US broad equity:           VOO, VTI, SPY, IVV, SPLG, ITOT, SCHB
-        US large-cap factor tilts: QUAL, MTUM, VLUE, USMV, SPHQ, SPLV
-        US dividend tilts:         SCHD, DGRO, VYM, HDV, NOBL, DVY
-        US small-cap:              IWM, VB, IJR, SCHA, VTWO
-        Int'l developed equity:    VEA, IEFA, VXUS, SCHF, IDEV
-        Emerging-market equity:    VWO, IEMG, EEM, SCHE, SPEM
-        Intermediate Treasuries:   IEF, GOVT, VGIT, SCHR
-        Long Treasuries:           TLT, EDV, VGLT, SPTL
-        Short Treasuries / cash:   SHV, SHY, BIL, SGOV, GBIL
-        Investment-grade credit:   LQD, VCIT, VCSH, IGIB, IGSB
-        High-yield credit:         HYG, JNK, USHY, SHYG
-        US aggregate bonds:        AGG, BND, SCHZ, IUSB
-        TIPS / inflation-linked:   TIP, SCHP, VTIP, STIP, LTPZ
-        Municipal bonds:           MUB, VTEB, TFI, SUB
-        Gold:                      GLD, IAU, GLDM, SGOL, BAR
-        Broad commodities:         DBC, PDBC, GSG, BCI, COMT
-        US REITs:                  VNQ, IYR, SCHH, XLRE, RWR
-        Managed futures:           DBMF, KMLM, CTA, WTMF
+    HARD CAPS — the QA evaluator enforces these mechanically; a breach is an
+    automatic FAIL, so do not propose a portfolio that violates them:
+    • EQUITY BETA: small-cap, REITs and high-yield credit ARE equity beta
+      (~0.8-0.95 correlated with broad equity, converging to ~1 in a crash) —
+      NOT separate diversifiers.  One US-broad + one intl-developed + one EM
+      sleeve is fine (genuine geographic spread); beyond that add AT MOST ONE
+      further equity tilt — pick ONE of {factor, dividend, small-cap, REIT,
+      high-yield}.  Do not stack several.
+    • RATES / DURATION: hold AT MOST ONE pure-rates sleeve.  Investment-grade
+      corporate credit (LQD / VCIT / …) and aggregate bonds (AGG / BND) are
+      ~90% the SAME factor as Treasuries in daily moves — NOT independent from
+      duration.  Choose ONE of {a Treasury sleeve, an aggregate-bond sleeve,
+      an IG-credit sleeve}; do NOT combine them.  (TIPS is the separate
+      Inflation factor; T-bills / cash are the separate Cash factor — those do
+      NOT count against the rates cap.)
+    • INFLATION / COMMODITIES / GOLD / TREND / CASH: at most ONE sleeve each.
 
-    Picking VOO + QUAL + SCHD is NOT diversification — all three are
-    ~0.85-0.95 correlated US large-cap equity.  Pick one.  Same for
-    IEF + GOVT, TLT + EDV, LQD + VCIT, GLD + IAU, etc.
+    Worked examples (the trap this prevents):
+        VTI + IJR   -> ONE bet (rho ~ 0.85).  Drop IJR, or let it be your single tilt.
+        IEF + VCIT  -> ONE bet (rho ~ 0.92).  Pick one; both are duration.
+        IEF + SCHP  -> TWO bets (rates + inflation).  Good — keep both.
+        IEF + GLD   -> TWO bets (duration + monetary).  Good — keep both.
 
-    Across groups, also be deliberate: do not combine instruments whose
-    main risk factor is the same in different wrappers (e.g., HYG +
-    high-equity-beta credit is mostly equity risk; LTPZ + EDV is mostly
-    long-duration rate risk).  Spread across genuinely independent
-    factors — equity, duration, credit, inflation-linked, gold,
-    commodities, managed futures.
-
-    If you must pick a ticker not on these lists, do so — but state
-    explicitly in the rationale why it does not overlap with anything
-    already in your allocation.
+    If you deliberately keep a same-factor pair, the rationale MUST name the
+    DISTINCT regime payoff it adds; "more of the same factor" is not a reason.
+    If you pick a ticker not listed above, state in the rationale which factor
+    it belongs to and that it does not double up a factor you already hold.
 
 
     Respond ONLY with a JSON object:
@@ -238,7 +300,13 @@ def run_generator(
         user_msg += f"\nEVALUATOR FEEDBACK FROM PREVIOUS ROUND:\n{feedback}\n"
         user_msg += "\nAddress every issue raised.  Revise the portfolio accordingly."
 
-    raw = call_claude(generator_system(max_loss), user_msg)
+    raw = call_claude(
+        generator_system(max_loss), user_msg,
+        # The Generator emits a full portfolio JSON after its reasoning; on an
+        # always-on-thinking model (e.g. Fable 5) the 4096 default is consumed
+        # by thinking before any text is emitted.  See api.GENERATOR_MAX_TOKENS.
+        max_tokens=api.GENERATOR_MAX_TOKENS,
+    )
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
     data = _parse_json_response(raw, agent="generator")
@@ -408,6 +476,7 @@ def run_evaluator(
     *,
     pass_threshold: int = 7,
     max_loss: float = 0.05,
+    growth_ceiling: float | None = None,
 ) -> EvaluationResult:
     """
     Score the proposal on five criteria and produce a critique.  The
@@ -417,6 +486,14 @@ def run_evaluator(
     three must hold.  ``pass_threshold`` and ``max_loss`` are the
     orchestrator's policy knobs (live in ``harness.py``) and are passed
     in so this module stays orchestrator-agnostic.
+
+    When ``growth_ceiling`` is not None (the horizon glide-path ceiling),
+    an additional DETERMINISTIC, MECHANICAL gate runs on top of the LLM
+    judgement: the portfolio's growth-asset weight is measured via the
+    shared classifier (``harness.growth_asset_weight``) and, if it EXCEEDS
+    the ceiling, ``passed`` is forced False and a specific critique line is
+    appended.  This gate can only turn a pass into a fail, never the
+    reverse — it cannot rescue an LLM-failed proposal.
     """
     print("\n" + "=" * 60)
     print("EVALUATOR — stress-testing the portfolio …")
@@ -431,6 +508,9 @@ def run_evaluator(
         evaluator_system(max_loss), user_msg,
         tools=_BACKTEST_TOOLS,
         tool_handlers=_BACKTEST_HANDLERS,
+        # Long stress narration + JSON scores/critique (now incl. the growth
+        # ceiling) truncate at the 4096 default; give it Refiner-level room.
+        max_tokens=api.EVALUATOR_MAX_TOKENS,
         # 3 standard stress windows + headroom for sub-scenarios + final
         # text emission; well clear of the default 8 but explicit here so
         # the cap is documented at the call site.
@@ -454,11 +534,52 @@ def run_evaluator(
         and model_said_passed
     )
 
+    critique = data.get("critique", "")
+
+    # --- Deterministic growth-ceiling gate (horizon glide path) ---------
+    # A hard, mechanical check ON TOP of the LLM judgement.  Lazy import of
+    # the shared classifier from harness avoids a circular import at module
+    # load (harness imports this module at its top).  This can only turn a
+    # pass into a fail — never the reverse.
+    if growth_ceiling is not None:
+        from harness import growth_asset_weight  # lazy — avoids import cycle
+        measured = growth_asset_weight(proposal)
+        if measured > growth_ceiling + 1e-9:
+            passed = False
+            ceiling_note = (
+                f"GROWTH-CEILING VIOLATION (deterministic check): measured "
+                f"growth-asset weight {measured:.1%} EXCEEDS the horizon "
+                f"ceiling of {growth_ceiling:.0%}. Growth assets (equity, "
+                f"REITs, commodities, gold, managed futures, high-yield "
+                f"credit) must be reduced to at or below {growth_ceiling:.0%}, "
+                f"with the remainder in high-grade bonds / TIPS / cash. "
+                f"Forced QA FAIL regardless of scores."
+            )
+            critique = (critique + "\n\n" + ceiling_note) if critique else ceiling_note
+
+    # --- Deterministic factor-budget gate (construction taxonomy) ---------
+    # Independent of the horizon growth ceiling: enforces "at most one sleeve
+    # per macro risk factor" for the two factors most prone to redundant
+    # cousins (rates/duration and equity beta) — instruments in different
+    # product categories that nonetheless run ~0.8-0.95 correlated.  Like the
+    # ceiling gate above, it can only turn a pass into a fail, never the
+    # reverse.  Lazy import avoids the harness<->agents import cycle.
+    from harness import factor_budget_violations  # lazy — avoids import cycle
+    fb_violations = factor_budget_violations(proposal)
+    if fb_violations:
+        passed = False
+        fb_note = (
+            "FACTOR-BUDGET VIOLATION (deterministic check): "
+            + " ".join(fb_violations)
+            + " Forced QA FAIL regardless of scores."
+        )
+        critique = (critique + "\n\n" + fb_note) if critique else fb_note
+
     return EvaluationResult(
         passed=passed,
         scores=scores,
         average_score=round(avg, 2),
-        critique=data.get("critique", ""),
+        critique=critique,
         raw_text=raw,
     )
 
@@ -579,104 +700,5 @@ def run_refiner(
         expected_max_drawdown=data.get("expected_max_drawdown", 0),
         methodology=data.get("methodology", ""),
         rationale=data.get("rationale", ""),
-        raw_text=raw,
-    )
-
-
-# ---------------------------------------------------------------------------
-# AGENT 5 — ADVISOR  (advisory only, never modifies the portfolio)
-# ---------------------------------------------------------------------------
-ADVISOR_SYSTEM = textwrap.dedent("""\
-    You are a portfolio diversification advisor.  You are NOT allowed to
-    change the portfolio.  Your single job is to look at the FINAL
-    portfolio (which has already passed QA or been chosen as the best
-    effort) and surface two things for the human reader:
-
-    1. A pairwise CORRELATION SNAPSHOT for tickers that move similarly.
-       For every PAIR of holdings whose long-run correlation is |ρ| ≥ 0.5,
-       output an entry.  Use realistic historical correlations (you may
-       approximate from memory; this is a snapshot, not a backtest).
-       Be honest about uncertainty — these are model-recalled, not
-       computed from data.
-
-    2. Concrete SIMPLIFICATION SUGGESTIONS.  For each cluster of highly
-       correlated holdings (typically ρ ≥ 0.75) that look redundant,
-       propose a specific consolidation.
-
-    HARD RULES for suggestions:
-    • Suggest a REAL replacement ticker (e.g., GOVT, AGG, VXUS, BNDX)
-      that a US retail investor can buy easily.  Do not invent tickers.
-    • Be EXPLICIT about what the user gives up — every suggestion MUST
-      include a "tradeoff" string.  Examples of legitimate tradeoffs:
-        "Loses the explicit short/intermediate Treasury barbell."
-        "Loses tax-exempt muni income exposure."
-        "Combines investment-grade credit with Treasuries — credit risk
-         becomes implicit rather than sized separately."
-    • Do NOT suggest consolidations across genuinely different risk
-      factors (e.g., merging LQD into IEF collapses credit and rate
-      exposure — flag it as a NOT-recommended merge if you mention it).
-    • If the portfolio is already well-consolidated, return an empty
-      "suggestions" list rather than inventing weak ideas.
-
-    Respond ONLY with a JSON object:
-    {
-      "correlation_pairs": [
-        {"a": "TICKER_A", "b": "TICKER_B", "rho": 0.85,
-         "note": "optional short context"},
-        ...
-      ],
-      "suggestions": [
-        {
-          "merge_from": ["TICKER_X", "TICKER_Y"],
-          "merge_into": "REPLACEMENT_TICKER",
-          "rationale": "one-sentence why they overlap",
-          "tradeoff": "explicit description of what is lost"
-        },
-        ...
-      ],
-      "notes": "optional caveats about correlation estimates / regime sensitivity"
-    }
-
-    No markdown fences — raw JSON only.
-""")
-
-
-def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
-    """
-    Inspect a portfolio and produce advisory consolidation suggestions
-    plus a pairwise correlation snapshot.  Never modifies the portfolio
-    itself.  Used in two places by the orchestrator — between iterations
-    (its findings feed the next Generator round's prompt) and after the
-    final portfolio is determined (read-only, for the report).
-    """
-    print("\n" + "=" * 60)
-    print("ADVISOR — scanning final portfolio for correlation / simplification …")
-    print("=" * 60)
-
-    # Build a compact view of the holdings (ticker, weight, description)
-    rows = []
-    descs = final_proposal.descriptions or {}
-    for ticker, weight in final_proposal.allocations.items():
-        desc = descs.get(ticker, "")
-        rows.append(f"  {ticker:30s}  {float(weight):.2%}   {desc}")
-    holdings_block = "\n".join(rows) if rows else "  (empty)"
-
-    user_msg = (
-        f"FINAL PORTFOLIO (do NOT modify — advise only):\n{holdings_block}\n\n"
-        f"Produce the correlation snapshot and simplification suggestions "
-        f"per the system prompt schema.  Focus on pairs that move together "
-        f"in normal regimes; flag (in notes) any pairs whose correlation "
-        f"changes materially in stress."
-    )
-
-    raw = call_claude(ADVISOR_SYSTEM, user_msg, model=api.ADVISOR_MODEL)
-    print(raw[:500], "…\n" if len(raw) > 500 else "\n")
-
-    data = _parse_json_response(raw, agent="advisor")
-
-    return AdvisorOutput(
-        suggestions=data.get("suggestions", []) or [],
-        correlation_pairs=data.get("correlation_pairs", []) or [],
-        notes=data.get("notes", "") or "",
         raw_text=raw,
     )

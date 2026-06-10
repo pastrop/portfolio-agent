@@ -4,7 +4,7 @@ Synchronous wrapper around ``harness.run_harness`` for the server.
 Responsibilities:
 
   * Snapshot the project's mutable module globals (``api.MODEL`` /
-    ``api.PLANNER_MODEL`` / ``api.ADVISOR_MODEL`` / ``harness.MAX_ITERATIONS``),
+    ``api.PLANNER_MODEL`` / ``harness.MAX_ITERATIONS``),
     patch them per the request, then restore on exit.  Mirrors the
     behaviour of the CLI's ``__main__`` block in ``harness.py`` and means
     out-of-band CLI runs in a separate process see no interference.
@@ -144,14 +144,56 @@ def _resolve_model_patches(req: RunRequest) -> Optional[str]:
 
 
 def _build_result_summary(result: dict[str, Any]) -> ResultSummary:
+    """
+    Collapse the full result dict into the compact ``ResultSummary``.
+
+    Phase 2 makes this regime-aware (see ``ResultSummary`` docstring):
+
+      * ``mode`` is echoed from the result (default ``"optimized"`` for
+        backward-compatible pre-Phase-2 traces that lack the key).
+      * ``annualized_return`` is surfaced from the no-LLM Monte-Carlo
+        ``risk_profile`` so preservation runs (whose
+        ``final_proposal.expected_*`` are JSON null) still report a real
+        expected return instead of a flat zero.  ``None`` when the risk
+        pass didn't run.
+      * ``passed_qa`` is ``None`` in preservation mode — the deterministic
+        template never went through the Generator↔Evaluator QA loop, so a
+        ``true``/``false`` here would be misleading.
+    """
     final_prop = result.get("final_proposal") or {}
     final_eval = result.get("final_evaluation") or {}
+    risk_profile = result.get("risk_profile") or {}
+    mode = result.get("mode", "optimized")
+
+    # expected_* are JSON null in preservation mode — guard the casts so
+    # we record 0.0 (not a TypeError) for those self-describing nulls.
+    expected_return = final_prop.get("expected_annual_return")
+    expected_drawdown = final_prop.get("expected_max_drawdown")
+
+    # Surface the realized annualized return from the risk profile when
+    # present (a no-LLM pass, populated in both regimes).  A skipped
+    # risk block carries no numeric field → leave it None.
+    raw_ann_ret = risk_profile.get("annualized_return")
+    annualized_return = (
+        float(raw_ann_ret) if isinstance(raw_ann_ret, (int, float)) else None
+    )
+
+    # passed_qa is meaningful only when the optimizer's Evaluator actually
+    # ran; in preservation mode there is no QA verdict to report.
+    passed_qa: Optional[bool]
+    if mode == "preservation":
+        passed_qa = None
+    else:
+        passed_qa = bool(final_eval.get("passed", False))
+
     return ResultSummary(
+        mode=mode,
         selected_iteration=result.get("selected_iteration"),
         final_average_score=float(final_eval.get("average_score") or 0),
-        final_expected_return=float(final_prop.get("expected_annual_return") or 0),
-        final_expected_max_drawdown=float(final_prop.get("expected_max_drawdown") or 0),
-        passed_qa=bool(final_eval.get("passed", False)),
+        final_expected_return=float(expected_return or 0),
+        final_expected_max_drawdown=float(expected_drawdown or 0),
+        annualized_return=annualized_return,
+        passed_qa=passed_qa,
     )
 
 
@@ -170,7 +212,6 @@ def execute_run_sync(
     # --- Snapshot mutable project globals so we can restore in finally ---
     orig_model = api.MODEL
     orig_planner = api.PLANNER_MODEL
-    orig_advisor = api.ADVISOR_MODEL
     orig_max_iter = harness.MAX_ITERATIONS
     orig_max_loss = harness.TARGET_MAX_LOSS
     orig_under_band = harness.UNDER_UTILISATION_BAND
@@ -178,15 +219,15 @@ def execute_run_sync(
     # --- Resolve effective flags (test mode overrides explicit flags) ---
     if req.test:
         refine = False
-        advise = False
         price = False
         risk = False
+        correlation = False
         iterations: Optional[int] = 1
     else:
         refine = req.refine
-        advise = req.advise
         price = req.price
         risk = req.risk
+        correlation = req.correlation
         iterations = req.iterations
 
     # --- Apply patches ---
@@ -194,7 +235,13 @@ def execute_run_sync(
     if override_model is not None:
         api.MODEL = override_model
         api.PLANNER_MODEL = override_model
-        api.ADVISOR_MODEL = override_model
+    # --reasoning-model equivalent: override ONLY the heavy agents (api.MODEL),
+    # leaving the Planner. Ignored under test (which forces Haiku everywhere).
+    # Applied after the all-agent override so it wins for the heavy agents.
+    # api.MODEL is already snapshotted above, so the finally-block restore
+    # covers this with no extra bookkeeping.
+    if not req.test and req.reasoning_model:
+        api.MODEL = MODEL_ALIASES.get(req.reasoning_model, req.reasoning_model)
     if iterations is not None:
         harness.MAX_ITERATIONS = iterations
     # --max-loss equivalent: patch TARGET_MAX_LOSS and recompute the
@@ -226,8 +273,11 @@ def execute_run_sync(
             _REAL_STDOUT.write(
                 f"\n[run {artifacts_dir.name}] starting "
                 f"(model_override={override_model or '<per-agent mix>'}, "
+                f"reasoning_model={(req.reasoning_model or '-') if not req.test else '-'}, "
                 f"iterations={iterations if iterations is not None else harness.MAX_ITERATIONS}, "
-                f"refine={refine}, advise={advise}, price={price}, risk={risk})\n"
+                f"horizon={req.horizon_years}y, "
+                f"refine={refine}, price={price}, risk={risk}, "
+                f"correlation={correlation})\n"
             )
             _REAL_STDOUT.flush()
 
@@ -236,10 +286,16 @@ def execute_run_sync(
                     result = harness.run_harness(
                         req.goal,
                         refine=refine,
-                        advise=advise,
                         price=price,
                         risk=risk,
+                        correlation=correlation,
                         capital=req.capital,
+                        # Plain function argument — NOT a patched/snapshotted
+                        # global like MODEL / MAX_ITERATIONS / TARGET_MAX_LOSS.
+                        # run_harness selects the regime (>=3y optimizer with a
+                        # glide-path ceiling vs <3y preservation short-circuit)
+                        # purely from this value; nothing to restore in finally.
+                        horizon_years=req.horizon_years,
                     )
                 except Exception as exc:
                     error_traceback = traceback.format_exc()
@@ -280,7 +336,6 @@ def execute_run_sync(
         # --- Restore globals ---
         api.MODEL = orig_model
         api.PLANNER_MODEL = orig_planner
-        api.ADVISOR_MODEL = orig_advisor
         harness.MAX_ITERATIONS = orig_max_iter
         harness.TARGET_MAX_LOSS = orig_max_loss
         harness.UNDER_UTILISATION_BAND = orig_under_band
