@@ -271,6 +271,129 @@ def growth_asset_weight(proposal: PortfolioProposal) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Risk-factor budget (shared with the Evaluator's deterministic factor gate
+# in agents.py via ``factor_budget_violations``)
+# ---------------------------------------------------------------------------
+# Coarser than the growth/defensive split AND coarser than product category:
+# it collapses each macro risk factor's many wrappers into one bucket, because
+# daily returns are dominated by the FACTOR, not the wrapper.  The two buckets
+# below are the ones most prone to redundant "cousins" — instruments in
+# different product categories that nonetheless load the SAME factor (and so
+# run ~0.8-0.95 correlated):
+#   • _RATES_TICKERS — Treasuries (any maturity), IG corporate credit,
+#     aggregate bonds, munis.  IG credit / agg are ~90% duration in daily
+#     moves, so they are NOT independent of Treasuries.  (TIPS are the separate
+#     INFLATION factor; short-Tsy / T-bills are the separate CASH factor —
+#     neither is counted here.)
+#   • _EQUITY_TILT — equity-beta sleeves BEYOND the core US-broad + intl + EM
+#     trio: factor, dividend, small-cap, REIT, high-yield.  All ~0.8-0.95
+#     correlated with broad equity (→ ~1 in a crash), so they are tilts, not
+#     diversifiers.
+# The gate caps each bucket at ONE sleeve (see ``factor_budget_violations``);
+# the other factors (inflation, commodities, gold, trend, cash, the equity
+# core) are left to the Generator prompt's per-factor "one sleeve" guidance.
+_RATES_TICKERS: frozenset[str] = frozenset({
+    # intermediate treasuries
+    "IEF", "GOVT", "VGIT", "SCHR",
+    # long treasuries
+    "TLT", "EDV", "VGLT", "SPTL",
+    # investment-grade corporate credit (~ duration daily; NOT independent)
+    "LQD", "VCIT", "VCSH", "IGIB", "IGSB",
+    # US aggregate bonds (~ duration + a thin credit/MBS tilt)
+    "AGG", "BND", "SCHZ", "IUSB",
+    # municipal bonds (duration)
+    "MUB", "VTEB", "TFI", "SUB", "VWITX",
+})
+_EQUITY_TILT: frozenset[str] = frozenset({
+    # US large-cap factor tilts
+    "QUAL", "MTUM", "VLUE", "USMV", "SPHQ", "SPLV",
+    # US dividend tilts
+    "SCHD", "DGRO", "VYM", "HDV", "NOBL", "DVY", "VIG",
+    # US small-cap
+    "IWM", "VB", "IJR", "SCHA", "VTWO",
+    # US REITs (equity-beta sector tilt)
+    "VNQ", "IYR", "SCHH", "XLRE", "RWR",
+    # high-yield credit (equity-beta, especially in stress)
+    "HYG", "JNK", "USHY", "SHYG",
+})
+
+
+def _factor_bucket(ticker: str) -> str | None:
+    """
+    Map a ticker to a capped factor bucket — ``"rates"``, ``"equity_tilt"``,
+    or ``None`` (everything the gate does not cap: equity core / intl / EM,
+    TIPS, commodities, gold, trend, cash, and unknowns).  Matches the raw
+    ticker first, then its ``RISK_PROXY_MAP`` long-history proxy, so proxied
+    young ETFs resolve too.
+    """
+    t = (ticker or "").strip().upper()
+    if t in _RATES_TICKERS:
+        return "rates"
+    if t in _EQUITY_TILT:
+        return "equity_tilt"
+    proxy = RISK_PROXY_MAP.get(t)
+    if proxy is not None:
+        p = proxy.upper()
+        if p in _RATES_TICKERS:
+            return "rates"
+        if p in _EQUITY_TILT:
+            return "equity_tilt"
+    return None
+
+
+def factor_budget_violations(proposal: PortfolioProposal) -> list[str]:
+    """
+    Deterministic factor-budget check for the construction taxonomy.  Returns
+    a list of human-readable violation strings (empty list -> no violation).
+
+    Enforces the two caps the Generator prompt declares binding (see its
+    DIVERSIFICATION block):
+      • AT MOST ONE pure-rates sleeve (Treasuries / IG credit / agg / muni all
+        load the same duration factor),
+      • AT MOST ONE equity tilt beyond core US + intl + EM (factor / dividend /
+        small-cap / REIT / high-yield are all equity beta).
+
+    The Evaluator (in ``agents.py``) calls this and forces a QA FAIL on any
+    violation — like the growth-ceiling gate, it can only turn a pass into a
+    fail, never the reverse.  Positive-weight holdings only; classification is
+    via :func:`_factor_bucket` (raw ticker, then proxy), so unknown tickers are
+    simply ignored by this gate.
+    """
+    allocations = proposal.allocations or {}
+    rates: list[str] = []
+    tilts: list[str] = []
+    for ticker, weight in allocations.items():
+        try:
+            if float(weight) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        bucket = _factor_bucket(ticker)
+        if bucket == "rates":
+            rates.append(ticker)
+        elif bucket == "equity_tilt":
+            tilts.append(ticker)
+
+    violations: list[str] = []
+    if len(rates) > 1:
+        violations.append(
+            f"RATES/DURATION over-budget: {len(rates)} sleeves "
+            f"({', '.join(rates)}) all load the same duration factor "
+            f"(Treasuries / IG credit / aggregate / muni run ~0.8-0.95 "
+            f"correlated daily). Hold AT MOST ONE; TIPS and cash are separate "
+            f"factors and do not count here."
+        )
+    if len(tilts) > 1:
+        violations.append(
+            f"EQUITY-BETA over-budget: {len(tilts)} tilts ({', '.join(tilts)}) "
+            f"are all equity beta (factor / dividend / small-cap / REIT / "
+            f"high-yield run ~0.8-0.95 correlated with broad equity). Keep AT "
+            f"MOST ONE tilt beyond core US + intl + EM."
+        )
+    return violations
+
+
+# ---------------------------------------------------------------------------
 # Horizon helpers
 # ---------------------------------------------------------------------------
 def posture_for_horizon(horizon_years: int) -> dict[str, Any]:

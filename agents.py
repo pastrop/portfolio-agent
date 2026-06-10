@@ -211,47 +211,52 @@ _GENERATOR_SYSTEM_TEMPLATE = textwrap.dedent("""\
     {MAX_LOSS}, raise the return profile by deploying more risk-bearing exposure
     until your drawdown is near (but under) {MAX_LOSS}.
 
-    DIVERSIFICATION — IMPORTANT:
-    The portfolio must be diversified across genuinely independent risk
-    factors, not just across many tickers.  LLMs cannot reliably estimate
-    pairwise correlations from memory, so DO NOT try.  Instead, use this
-    explicit rule:
+    DIVERSIFICATION — BUDGET BY RISK FACTOR, NOT BY PRODUCT LABEL:
+    A portfolio is diversified when its risk is spread across factors that
+    pay off in DIFFERENT regimes — NOT when it holds many tickers.  Many
+    products that look distinct share ONE factor and move together (often
+    rho > 0.9), which buys you no diversification.  You cannot reliably
+    estimate correlations from memory, so DO NOT try — budget by the factor
+    map below and respect its caps instead.
 
-        From each overlap group below, choose AT MOST ONE ticker.
+        FACTOR            ROLE / WHEN IT HELPS          INSTRUMENTS (any one fills the factor)
+        Equity beta       growth; the return engine     US broad / factor / dividend / small-cap,
+                                                         intl developed, EM, REITs, high-yield credit
+        Rates / duration  ballast in a GROWTH shock     Treasuries (any maturity), IG corporate
+                                                         credit, aggregate bonds, munis
+        Inflation         ballast in an INFLATION shock TIPS
+        Commodities       supply / energy shock         broad commodities
+        Gold              monetary / geopolitical tail  gold
+        Trend             crisis trend-following        managed futures
+        Cash              liquidity, ~0 duration        T-bills / 0-3 month
 
-        US broad equity:           VOO, VTI, SPY, IVV, SPLG, ITOT, SCHB
-        US large-cap factor tilts: QUAL, MTUM, VLUE, USMV, SPHQ, SPLV
-        US dividend tilts:         SCHD, DGRO, VYM, HDV, NOBL, DVY
-        US small-cap:              IWM, VB, IJR, SCHA, VTWO
-        Int'l developed equity:    VEA, IEFA, VXUS, SCHF, IDEV
-        Emerging-market equity:    VWO, IEMG, EEM, SCHE, SPEM
-        Intermediate Treasuries:   IEF, GOVT, VGIT, SCHR
-        Long Treasuries:           TLT, EDV, VGLT, SPTL
-        Short Treasuries / cash:   SHV, SHY, BIL, SGOV, GBIL
-        Investment-grade credit:   LQD, VCIT, VCSH, IGIB, IGSB
-        High-yield credit:         HYG, JNK, USHY, SHYG
-        US aggregate bonds:        AGG, BND, SCHZ, IUSB
-        TIPS / inflation-linked:   TIP, SCHP, VTIP, STIP, LTPZ
-        Municipal bonds:           MUB, VTEB, TFI, SUB
-        Gold:                      GLD, IAU, GLDM, SGOL, BAR
-        Broad commodities:         DBC, PDBC, GSG, BCI, COMT
-        US REITs:                  VNQ, IYR, SCHH, XLRE, RWR
-        Managed futures:           DBMF, KMLM, CTA, WTMF
+    HARD CAPS — the QA evaluator enforces these mechanically; a breach is an
+    automatic FAIL, so do not propose a portfolio that violates them:
+    • EQUITY BETA: small-cap, REITs and high-yield credit ARE equity beta
+      (~0.8-0.95 correlated with broad equity, converging to ~1 in a crash) —
+      NOT separate diversifiers.  One US-broad + one intl-developed + one EM
+      sleeve is fine (genuine geographic spread); beyond that add AT MOST ONE
+      further equity tilt — pick ONE of {factor, dividend, small-cap, REIT,
+      high-yield}.  Do not stack several.
+    • RATES / DURATION: hold AT MOST ONE pure-rates sleeve.  Investment-grade
+      corporate credit (LQD / VCIT / …) and aggregate bonds (AGG / BND) are
+      ~90% the SAME factor as Treasuries in daily moves — NOT independent from
+      duration.  Choose ONE of {a Treasury sleeve, an aggregate-bond sleeve,
+      an IG-credit sleeve}; do NOT combine them.  (TIPS is the separate
+      Inflation factor; T-bills / cash are the separate Cash factor — those do
+      NOT count against the rates cap.)
+    • INFLATION / COMMODITIES / GOLD / TREND / CASH: at most ONE sleeve each.
 
-    Picking VOO + QUAL + SCHD is NOT diversification — all three are
-    ~0.85-0.95 correlated US large-cap equity.  Pick one.  Same for
-    IEF + GOVT, TLT + EDV, LQD + VCIT, GLD + IAU, etc.
+    Worked examples (the trap this prevents):
+        VTI + IJR   -> ONE bet (rho ~ 0.85).  Drop IJR, or let it be your single tilt.
+        IEF + VCIT  -> ONE bet (rho ~ 0.92).  Pick one; both are duration.
+        IEF + SCHP  -> TWO bets (rates + inflation).  Good — keep both.
+        IEF + GLD   -> TWO bets (duration + monetary).  Good — keep both.
 
-    Across groups, also be deliberate: do not combine instruments whose
-    main risk factor is the same in different wrappers (e.g., HYG +
-    high-equity-beta credit is mostly equity risk; LTPZ + EDV is mostly
-    long-duration rate risk).  Spread across genuinely independent
-    factors — equity, duration, credit, inflation-linked, gold,
-    commodities, managed futures.
-
-    If you must pick a ticker not on these lists, do so — but state
-    explicitly in the rationale why it does not overlap with anything
-    already in your allocation.
+    If you deliberately keep a same-factor pair, the rationale MUST name the
+    DISTINCT regime payoff it adds; "more of the same factor" is not a reason.
+    If you pick a ticker not listed above, state in the rationale which factor
+    it belongs to and that it does not double up a factor you already hold.
 
 
     Respond ONLY with a JSON object:
@@ -551,6 +556,24 @@ def run_evaluator(
                 f"Forced QA FAIL regardless of scores."
             )
             critique = (critique + "\n\n" + ceiling_note) if critique else ceiling_note
+
+    # --- Deterministic factor-budget gate (construction taxonomy) ---------
+    # Independent of the horizon growth ceiling: enforces "at most one sleeve
+    # per macro risk factor" for the two factors most prone to redundant
+    # cousins (rates/duration and equity beta) — instruments in different
+    # product categories that nonetheless run ~0.8-0.95 correlated.  Like the
+    # ceiling gate above, it can only turn a pass into a fail, never the
+    # reverse.  Lazy import avoids the harness<->agents import cycle.
+    from harness import factor_budget_violations  # lazy — avoids import cycle
+    fb_violations = factor_budget_violations(proposal)
+    if fb_violations:
+        passed = False
+        fb_note = (
+            "FACTOR-BUDGET VIOLATION (deterministic check): "
+            + " ".join(fb_violations)
+            + " Forced QA FAIL regardless of scores."
+        )
+        critique = (critique + "\n\n" + fb_note) if critique else fb_note
 
     return EvaluationResult(
         passed=passed,
