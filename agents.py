@@ -330,10 +330,13 @@ def run_generator(
 
     raw = call_claude(
         generator_system(max_loss), user_msg,
-        # The Generator emits a full portfolio JSON after its reasoning; on an
-        # always-on-thinking model (e.g. Fable 5) the 4096 default is consumed
-        # by thinking before any text is emitted.  See api.GENERATOR_MAX_TOKENS.
+        # The Generator emits a full portfolio JSON after its reasoning; the
+        # generous ceiling also covers any adaptive-thinking tokens (see
+        # api.GENERATOR_MAX_TOKENS).
         max_tokens=api.GENERATOR_MAX_TOKENS,
+        # Reason as hard as the model allows before emitting; silently dropped
+        # on models that reject effort (Haiku under --test).
+        effort=api.GENERATOR_EFFORT,
     )
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
@@ -539,6 +542,9 @@ def run_evaluator(
         # Long stress narration + JSON scores/critique (now incl. the growth
         # ceiling) truncate at the 4096 default; give it Refiner-level room.
         max_tokens=api.EVALUATOR_MAX_TOKENS,
+        # Run the stress windows thoroughly before scoring; silently dropped
+        # on models that reject effort (Haiku under --test).
+        effort=api.EVALUATOR_EFFORT,
         # 3 standard stress windows + headroom for sub-scenarios + final
         # text emission; well clear of the default 8 but explicit here so
         # the cap is documented at the call site.
