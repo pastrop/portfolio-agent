@@ -290,13 +290,41 @@ def run_generator(
     iteration: int = 1,
     *,
     max_loss: float = 0.05,
+    previous_proposal: PortfolioProposal | None = None,
 ) -> PortfolioProposal:
+    """
+    Build a portfolio proposal from the spec, optionally revising a prior
+    attempt in light of evaluator feedback.
+
+    On iterations after the first the orchestrator passes BOTH the previous
+    round's ``feedback`` (the evaluator critique) AND the ``previous_proposal``
+    it refers to.  Each ``call_claude`` is stateless — a fresh single-message
+    request with no conversation history — so without the prior proposal echoed
+    back the Generator would receive a critique about a portfolio it can no
+    longer see, forcing a blind redraw from the spec.  Including the prior
+    allocations turns the round into a targeted revision: the Generator can act
+    on the flagged issues AND preserve the holdings the critique did NOT flag
+    (mirroring how ``run_refiner`` is handed ``selected_proposal.raw_text``).
+
+    Back-compat: with ``previous_proposal=None`` (or on iteration 1, where there
+    is no feedback) the user message is byte-identical to the prior behaviour.
+    """
     print("\n" + "=" * 60)
     print(f"GENERATOR — building portfolio (iteration {iteration}) …")
     print("=" * 60)
 
     user_msg = f"INVESTMENT SPEC:\n{spec.raw_text}\n"
     if feedback:
+        # Echo the portfolio the feedback is ABOUT so this (stateless) call can
+        # revise it surgically instead of redrawing blind.  Guard on non-empty
+        # allocations: a prior round whose JSON failed to parse carries no
+        # usable book, so fall back to feedback-only rather than feeding junk.
+        if previous_proposal is not None and previous_proposal.allocations:
+            user_msg += (
+                f"\nYOUR PREVIOUS PORTFOLIO (the feedback below is about THIS "
+                f"allocation — revise it, and KEEP the holdings the critique "
+                f"does not flag):\n{previous_proposal.raw_text}\n"
+            )
         user_msg += f"\nEVALUATOR FEEDBACK FROM PREVIOUS ROUND:\n{feedback}\n"
         user_msg += "\nAddress every issue raised.  Revise the portfolio accordingly."
 
