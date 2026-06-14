@@ -741,6 +741,9 @@ def run_refiner(
     raw = call_claude(
         refiner_system(max_loss), user_msg,
         max_tokens=api.REFINER_MAX_TOKENS,
+        # Max effort: verify the revision thoroughly against real history
+        # before emitting (silently dropped on Haiku under --test).
+        effort=api.REFINER_EFFORT,
         tools=_BACKTEST_TOOLS,
         tool_handlers=_BACKTEST_HANDLERS,
         # Refiner may iterate: backtest → see breach → adjust weights →

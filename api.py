@@ -74,15 +74,17 @@ PLANNER_MAX_TOKENS = 8192
 # `effort` (GA on Opus 4.5+, Sonnet 4.6, Fable 5 — NOT Haiku 4.5 / Sonnet 4.5)
 # trades token spend for thoroughness: it tunes how deeply the model reasons
 # (when thinking is on) AND how thoroughly it acts.  At "max" the Generator
-# reasons harder before emitting and the Evaluator runs more of its backtest
-# tool calls.  The API default is "high"; the ladder is low < medium < high <
-# xhigh < max, so "max" is the ceiling.  Use "max" when correctness matters
-# more than cost — which it does for portfolio construction + QA.  Applied via
-# call_claude(effort=...) and gated by _model_supports_effort so a --test
-# (Haiku) run doesn't 400.  Pairs best with adaptive thinking; see the
-# max_tokens note above.
+# reasons harder before emitting, and the Evaluator and Refiner run more of
+# their compute_backtest tool calls to verify against real history.  The API
+# default is "high"; the ladder is low < medium < high < xhigh < max, so "max"
+# is the ceiling.  Use "max" when correctness matters more than cost — which it
+# does for portfolio construction + QA.  Applied via call_claude(effort=...)
+# and gated by _model_supports_effort so a --test (Haiku) run doesn't 400.
+# Pairs best with adaptive thinking; see the max_tokens note above.
 GENERATOR_EFFORT = "max"
 EVALUATOR_EFFORT = "max"
+REFINER_EFFORT = "max"   # the post-loop finisher; it has compute_backtest and
+                         # is the only construction agent that sees ground truth
 
 
 # ---------------------------------------------------------------------------
