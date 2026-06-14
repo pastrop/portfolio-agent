@@ -393,19 +393,33 @@ _EVALUATOR_SYSTEM_TEMPLATE = textwrap.dedent("""\
        max annual loss constraint under realistic historical scenarios?
        Check: 2008 GFC, 2020 COVID crash, 2022 rate-hike drawdown.
 
-       IMPORTANT — RESPECT THE SPEC'S ENFORCEMENT MECHANISM:
+       CRITICAL — CREDIT A MECHANISM ONLY IF THE DELIVERED PORTFOLIO CAN
+       ACTUALLY EXECUTE IT WITH WHAT IT HOLDS:
        If the spec's `constraints` define an `enforcement_mechanism` for
-       the loss cap (e.g., a dynamic de-risking trigger, an options
-       hedge overlay, a rebalancing rule), MODEL that mechanism when
-       computing each scenario's loss.  Apply the trigger logic (or
-       hedge payoff) to the gross drawdown, then judge the
-       POST-mechanism net annual loss against the {MAX_LOSS} cap.
+       the loss cap, you may credit it ONLY to the extent the delivered
+       `allocations` can carry it out:
+         • DYNAMIC RULES executable with the HELD assets — a de-risking
+           trigger, a rebalancing rule, a YTD-loss stop that sells held
+           equity into held cash/bonds — ARE creditable. Model the rule
+           on the gross drawdown and judge the POST-mechanism net annual
+           loss against the {MAX_LOSS} cap.
+         • An INSTRUMENT OVERLAY (a protective put / collar / option
+           hedge on SPY / IVV / an index ETF) is creditable ONLY IF that
+           instrument is an ACTUAL LINE ITEM in the proposed `allocations`
+           (a held position with a weight, e.g. a put-spread leg). If the
+           spec names a put overlay but `allocations` contains NO such
+           instrument, the portfolio does NOT hold the hedge — DO NOT
+           credit it. Judge that portfolio on its GROSS loss, because a
+           hedge that is not in the book will not protect a real investor
+           who buys the listed holdings.
 
-       A pre-mechanism gross loss above {MAX_LOSS} is acceptable IF the
-       mechanism plausibly contains the post-mechanism annual loss to
-       ≤ {MAX_LOSS}.  The spec defined the mechanism; honour it.
+       A pre-mechanism gross loss above {MAX_LOSS} is acceptable ONLY when
+       a CREDITABLE mechanism (per the two bullets above) plausibly
+       contains the post-mechanism annual loss to ≤ {MAX_LOSS}. An
+       un-held instrument overlay is NOT creditable and cannot rescue a
+       gross breach — do not assume a hedge the portfolio did not buy.
 
-       Score ≤ 4 only when either:
+       Score ≤ 4 when ANY of:
          • The post-mechanism net annual loss STILL breaches {MAX_LOSS} in a
            realistic scenario — i.e., even when the mechanism works
            as designed, the portfolio would have lost more than {MAX_LOSS} in
@@ -415,7 +429,13 @@ _EVALUATOR_SYSTEM_TEMPLATE = textwrap.dedent("""\
            enough to blow through it in a single session; an options
            overlay is sized too small to offset the expected loss;
            the trigger requires liquidity that wouldn't exist in the
-           scenario being modelled).
+           scenario being modelled), OR
+         • The portfolio meets the {MAX_LOSS} cap ONLY by crediting an
+           INSTRUMENT OVERLAY (put / collar / option hedge) that is NOT a
+           held line item in `allocations` — i.e. its GROSS loss breaches
+           {MAX_LOSS} and the hedge it leans on is not actually in the book.
+           A book whose floor depends on an un-held hedge is not deliverable
+           as a ≤{MAX_LOSS} portfolio; score it ≤ 4.
 
        ALSO score ≤ 6 if the expected_max_drawdown is materially BELOW
        {MAX_LOSS} (e.g., well under it) without a specific constraint forcing that
@@ -466,6 +486,11 @@ _EVALUATOR_SYSTEM_TEMPLATE = textwrap.dedent("""\
         have lost more than {MAX_LOSS} in 2008 / 2020 / 2022.  A pre-mechanism
         gross loss above {MAX_LOSS} is NOT a fail on its own when the mechanism
         plausibly contains the post-mechanism loss.
+      • The {MAX_LOSS} cap is met ONLY via an instrument overlay (put /
+        collar / option hedge) that is NOT actually held in `allocations`
+        — the delivered book breaches the cap GROSS and the hedge it
+        relies on is not in it. (A creditable dynamic rule executable with
+        the HELD assets does not trigger this; an un-held put overlay does.)
       • Material methodology gaps that make the loss estimates
         unreliable (e.g., key scenarios not stress-tested at all,
         return / risk numbers invented out of thin air, instruments

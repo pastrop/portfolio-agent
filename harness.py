@@ -38,6 +38,7 @@ from models import (
     PortfolioProposal,
 )
 from correlation import CORRELATION_DISCLAIMER, run_correlation
+from loss_floor import LOSS_FLOOR_DISCLAIMER, run_loss_floor_check
 from pricing import DEFAULT_CAPITAL, PRICING_DISCLAIMER, run_pricing
 from report import write_markdown_report
 from risk import RISK_DISCLAIMER, RISK_PROXY_MAP, run_risk_profile
@@ -585,12 +586,40 @@ def _select_best_iteration(history: list[dict]) -> int | None:
     return best["iteration"]
 
 
+def _print_loss_floor_verdict(block: dict[str, Any], max_loss: float) -> None:
+    """Print a clear console verdict for the deterministic loss-floor check."""
+    if not block.get("performed"):
+        reason = block.get("skipped_reason") or block.get("error") or "n/a"
+        print(f"\n(Loss-floor check inconclusive — {reason}.)\n")
+        return
+    worst = block.get("worst_gross_annual_loss")
+    wy = block.get("worst_year")
+    if block.get("relies_on_unheld_mechanism"):
+        print(
+            f"\n❌  LOSS-FLOOR: delivered book lost {worst:.1%} GROSS in {wy} "
+            f"(cap {max_loss:.0%}) and holds NO hedge leg — its ≤{max_loss:.0%} "
+            f"claim relies on a mechanism that is NOT in the portfolio.\n"
+        )
+    elif block.get("organic_pass"):
+        print(
+            f"\n✅  LOSS-FLOOR: delivered book is ORGANICALLY within "
+            f"{max_loss:.0%} (worst gross {worst:.1%} in {wy}).\n"
+        )
+    else:
+        legs = ", ".join(block.get("hedge_legs") or [])
+        print(
+            f"\n⚠️  LOSS-FLOOR: delivered book breaches {max_loss:.0%} gross "
+            f"({worst:.1%} in {wy}) but holds hedge leg(s): {legs}.\n"
+        )
+
+
 def _run_preservation(
     horizon_years: int,
     *,
     price: bool,
     risk: bool,
     correlation: bool,
+    loss_floor: bool,
     capital: float,
 ) -> dict[str, Any]:
     """
@@ -726,6 +755,21 @@ def _run_preservation(
             **asdict(correlation_result),
         }
 
+    loss_floor_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": LOSS_FLOOR_DISCLAIMER,
+        "error": None,
+    }
+    if not loss_floor:
+        loss_floor_block["skipped_reason"] = "disabled via --no-loss-floor / --test"
+    elif not allocations:
+        loss_floor_block["skipped_reason"] = "no allocations to check"
+    else:
+        loss_floor_block = run_loss_floor_check(
+            allocations, max_loss=TARGET_MAX_LOSS, descriptions=descriptions,
+        )
+
     return {
         "model": api.MODEL,
         "max_iterations": MAX_ITERATIONS,
@@ -754,6 +798,7 @@ def _run_preservation(
         "pricing": pricing_block,
         "risk_profile": risk_block,
         "correlation": correlation_block,
+        "loss_floor": loss_floor_block,
     }
 
 
@@ -764,6 +809,7 @@ def run_harness(
     price: bool = True,
     risk: bool = True,
     correlation: bool = True,
+    loss_floor: bool = True,
     capital: float = DEFAULT_CAPITAL,
     horizon_years: int = DEFAULT_HORIZON_YEARS,
 ) -> dict[str, Any]:
@@ -813,7 +859,8 @@ def run_harness(
     if horizon_years < HORIZON_FLOOR_YEARS:
         return _run_preservation(
             horizon_years,
-            price=price, risk=risk, correlation=correlation, capital=capital,
+            price=price, risk=risk, correlation=correlation,
+            loss_floor=loss_floor, capital=capital,
         )
 
     # --- Optimized regime: derive the glide-path posture deterministically ---
@@ -1067,6 +1114,28 @@ def run_harness(
             **asdict(correlation_result),
         }
 
+    # --- Step 9: Loss-floor compliance (deterministic backtest of the
+    # DELIVERED book; flags a ≤cap claim that rests on an un-held hedge) ---
+    loss_floor_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "disclaimer": LOSS_FLOOR_DISCLAIMER,
+        "error": None,
+    }
+    if not loss_floor:
+        loss_floor_block["skipped_reason"] = "disabled via --no-loss-floor / --test"
+        print("\n(Loss-floor check skipped.)\n")
+    elif not final_proposal.allocations:
+        loss_floor_block["skipped_reason"] = "no allocations to check"
+        print("\n(Loss-floor check skipped — no allocations.)\n")
+    else:
+        loss_floor_block = run_loss_floor_check(
+            final_proposal.allocations,
+            max_loss=TARGET_MAX_LOSS,
+            descriptions=final_proposal.descriptions,
+        )
+        _print_loss_floor_verdict(loss_floor_block, TARGET_MAX_LOSS)
+
     return {
         "model": api.MODEL,
         "max_iterations": MAX_ITERATIONS,
@@ -1086,6 +1155,7 @@ def run_harness(
         "pricing": pricing_block,
         "risk_profile": risk_block,
         "correlation": correlation_block,
+        "loss_floor": loss_floor_block,
     }
 
 
@@ -1219,6 +1289,18 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--no-loss-floor",
+        action="store_true",
+        help=(
+            "Skip the post-selection Loss-floor compliance check. By default, "
+            "after the final portfolio is determined, a no-LLM step backtests "
+            "the DELIVERED holdings over the calendar-year stress windows "
+            "(2008/2020/2022, proxy-substituted) and flags when the book's "
+            "≤max-loss claim relies on a hedge it does not actually hold. "
+            "yfinance-backed and fail-soft. --test implies --no-loss-floor."
+        ),
+    )
+    parser.add_argument(
         "--max-loss",
         type=float,
         metavar="FRACTION",
@@ -1272,6 +1354,7 @@ if __name__ == "__main__":
     price = not args.no_prices
     risk = not args.no_risk
     correlation = not args.no_correlation
+    loss_floor = not args.no_loss_floor
     capital = args.capital
     if args.test:
         # --test forces ALL agents to haiku (and disables everything else).
@@ -1284,10 +1367,11 @@ if __name__ == "__main__":
         price = False         # --test always implies --no-prices
         risk = False          # --test always implies --no-risk
         correlation = False   # --test always implies --no-correlation
+        loss_floor = False    # --test always implies --no-loss-floor
         print(
             f"[TEST MODE] model={api.MODEL}  iterations={MAX_ITERATIONS}  "
             f"refine={refine}  price={price}  risk={risk}  "
-            f"correlation={correlation}"
+            f"correlation={correlation}  loss_floor={loss_floor}"
         )
     else:
         if args.model:
@@ -1365,6 +1449,7 @@ if __name__ == "__main__":
         price=price,
         risk=risk,
         correlation=correlation,
+        loss_floor=loss_floor,
         capital=capital,
         horizon_years=horizon_years,
     )
