@@ -290,22 +290,53 @@ def run_generator(
     iteration: int = 1,
     *,
     max_loss: float = 0.05,
+    previous_proposal: PortfolioProposal | None = None,
 ) -> PortfolioProposal:
+    """
+    Build a portfolio proposal from the spec, optionally revising a prior
+    attempt in light of evaluator feedback.
+
+    On iterations after the first the orchestrator passes BOTH the previous
+    round's ``feedback`` (the evaluator critique) AND the ``previous_proposal``
+    it refers to.  Each ``call_claude`` is stateless — a fresh single-message
+    request with no conversation history — so without the prior proposal echoed
+    back the Generator would receive a critique about a portfolio it can no
+    longer see, forcing a blind redraw from the spec.  Including the prior
+    allocations turns the round into a targeted revision: the Generator can act
+    on the flagged issues AND preserve the holdings the critique did NOT flag
+    (mirroring how ``run_refiner`` is handed ``selected_proposal.raw_text``).
+
+    Back-compat: with ``previous_proposal=None`` (or on iteration 1, where there
+    is no feedback) the user message is byte-identical to the prior behaviour.
+    """
     print("\n" + "=" * 60)
     print(f"GENERATOR — building portfolio (iteration {iteration}) …")
     print("=" * 60)
 
     user_msg = f"INVESTMENT SPEC:\n{spec.raw_text}\n"
     if feedback:
+        # Echo the portfolio the feedback is ABOUT so this (stateless) call can
+        # revise it surgically instead of redrawing blind.  Guard on non-empty
+        # allocations: a prior round whose JSON failed to parse carries no
+        # usable book, so fall back to feedback-only rather than feeding junk.
+        if previous_proposal is not None and previous_proposal.allocations:
+            user_msg += (
+                f"\nYOUR PREVIOUS PORTFOLIO (the feedback below is about THIS "
+                f"allocation — revise it, and KEEP the holdings the critique "
+                f"does not flag):\n{previous_proposal.raw_text}\n"
+            )
         user_msg += f"\nEVALUATOR FEEDBACK FROM PREVIOUS ROUND:\n{feedback}\n"
         user_msg += "\nAddress every issue raised.  Revise the portfolio accordingly."
 
     raw = call_claude(
         generator_system(max_loss), user_msg,
-        # The Generator emits a full portfolio JSON after its reasoning; on an
-        # always-on-thinking model (e.g. Fable 5) the 4096 default is consumed
-        # by thinking before any text is emitted.  See api.GENERATOR_MAX_TOKENS.
+        # The Generator emits a full portfolio JSON after its reasoning; the
+        # generous ceiling also covers any adaptive-thinking tokens (see
+        # api.GENERATOR_MAX_TOKENS).
         max_tokens=api.GENERATOR_MAX_TOKENS,
+        # Reason as hard as the model allows before emitting; silently dropped
+        # on models that reject effort (Haiku under --test).
+        effort=api.GENERATOR_EFFORT,
     )
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
@@ -511,6 +542,9 @@ def run_evaluator(
         # Long stress narration + JSON scores/critique (now incl. the growth
         # ceiling) truncate at the 4096 default; give it Refiner-level room.
         max_tokens=api.EVALUATOR_MAX_TOKENS,
+        # Run the stress windows thoroughly before scoring; silently dropped
+        # on models that reject effort (Haiku under --test).
+        effort=api.EVALUATOR_EFFORT,
         # 3 standard stress windows + headroom for sub-scenarios + final
         # text emission; well clear of the default 8 but explicit here so
         # the cap is documented at the call site.

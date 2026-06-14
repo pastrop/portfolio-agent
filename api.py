@@ -48,15 +48,17 @@ PLANNER_MODEL = "claude-sonnet-4-6"
 # ---------------------------------------------------------------------------
 MAX_TOKENS = 4096
 # ---- Heavy reasoning-agent headroom (Generator / Evaluator / Refiner) ----
-# These agents emit structured JSON AFTER a chunk of reasoning, and modern
-# models run adaptive "thinking" that is ALWAYS ON (Opus 4.x, Claude Fable 5);
-# those thinking tokens count against max_tokens.  A powerful thinker like
-# Fable 5 can spend the entire 4096 default on thinking and emit ZERO text
-# (stop_reason=max_tokens, 0-char response -> `_parse_json_response` falls back
-# to an empty dict and the agent's output is lost).  max_tokens is a CEILING,
-# not a target — you are billed for tokens actually generated, and adaptive
-# thinking self-regulates — so a generous ceiling is free insurance and does
-# not change cost or behavior on lighter-thinking models like Opus.
+# These agents emit structured JSON AFTER a chunk of reasoning, and when
+# adaptive "thinking" is enabled those thinking tokens count against
+# max_tokens.  A powerful thinker like Fable 5 can spend the entire 4096
+# default on thinking and emit ZERO text (stop_reason=max_tokens, 0-char
+# response -> `_parse_json_response` falls back to an empty dict and the
+# agent's output is lost).  max_tokens is a CEILING, not a target — you are
+# billed for tokens actually generated, and adaptive thinking self-regulates —
+# so a generous ceiling is free insurance.  NB: on Opus 4.7/4.8 adaptive
+# thinking is OFF unless the request sets thinking={"type":"adaptive"} (this
+# harness does not — yet), so today this headroom is slack on Opus and load-
+# bearing mainly for Fable; see GENERATOR_EFFORT / EVALUATOR_EFFORT below.
 GENERATOR_MAX_TOKENS = 16384   # full portfolio JSON (allocations + descriptions
                                # + methodology + rationale) after reasoning
 REFINER_MAX_TOKENS = 16384     # portfolio JSON + point-by-point critique reply
@@ -65,6 +67,22 @@ EVALUATOR_MAX_TOKENS = 16384   # multi-round backtest narration + scores/critiqu
 # spec (objective / constraints / asset_universe / risk_budget /
 # evaluation_criteria) plus web_search narration fits comfortably in 8192.
 PLANNER_MAX_TOKENS = 8192
+
+# ---------------------------------------------------------------------------
+# Effort (output_config.effort) for the heavy reasoning agents
+# ---------------------------------------------------------------------------
+# `effort` (GA on Opus 4.5+, Sonnet 4.6, Fable 5 — NOT Haiku 4.5 / Sonnet 4.5)
+# trades token spend for thoroughness: it tunes how deeply the model reasons
+# (when thinking is on) AND how thoroughly it acts.  At "max" the Generator
+# reasons harder before emitting and the Evaluator runs more of its backtest
+# tool calls.  The API default is "high"; the ladder is low < medium < high <
+# xhigh < max, so "max" is the ceiling.  Use "max" when correctness matters
+# more than cost — which it does for portfolio construction + QA.  Applied via
+# call_claude(effort=...) and gated by _model_supports_effort so a --test
+# (Haiku) run doesn't 400.  Pairs best with adaptive thinking; see the
+# max_tokens note above.
+GENERATOR_EFFORT = "max"
+EVALUATOR_EFFORT = "max"
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +228,24 @@ def _tool_result_content(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Internal: which models accept output_config.effort
+# ---------------------------------------------------------------------------
+def _model_supports_effort(model: str) -> bool:
+    """
+    Whether ``output_config.effort`` is accepted by ``model``.
+
+    Effort is GA on Opus 4.5+, Sonnet 4.6, and Fable 5, but Haiku 4.5 and
+    Sonnet 4.5 reject it with a 400.  This harness only ever runs
+    opus-4-7 / sonnet-4-6 / fable-5 / haiku-4-5 (the last via ``--test``), so
+    excluding Haiku is what matters in practice; sonnet-4-5 is excluded too for
+    safety.  Resolved at call time because ``--test`` patches ``MODEL`` to
+    Haiku globally.
+    """
+    m = model.lower()
+    return "haiku" not in m and "sonnet-4-5" not in m
+
+
+# ---------------------------------------------------------------------------
 # Public: Messages API wrapper (with optional tool-use loop)
 # ---------------------------------------------------------------------------
 def call_claude(
@@ -218,6 +254,7 @@ def call_claude(
     *,
     model: str | None = None,
     max_tokens: int = MAX_TOKENS,
+    effort: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_handlers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
     max_tool_rounds: int = 8,
@@ -232,6 +269,12 @@ def call_claude(
     ``model`` and ``max_tokens`` are agent-tunable knobs.  Both are
     resolved at call time so CLI patches to ``MODEL`` still apply.
     Default: ``MODEL`` (Opus) and ``MAX_TOKENS`` (4096).
+
+    ``effort`` (optional ``low``/``medium``/``high``/``xhigh``/``max``) sets
+    ``output_config.effort`` to trade token spend for reasoning depth +
+    thoroughness.  It is added to the request ONLY when the effective model
+    accepts it (see ``_model_supports_effort``), so passing ``effort="max"``
+    is safe even under ``--test`` (Haiku), where it is silently dropped.
 
     Tool use (optional)
     -------------------
@@ -276,6 +319,11 @@ def call_claude(
     }
     if tools:
         create_kwargs["tools"] = tools
+    if effort and _model_supports_effort(effective_model):
+        # output_config.effort tunes reasoning depth + thoroughness.  Silently
+        # skipped on models that reject it (Haiku under --test) so the smoke
+        # test still runs; resolved against effective_model (post --test patch).
+        create_kwargs["output_config"] = {"effort": effort}
 
     # Fast path: no tools means single round-trip, behavior identical
     # to the pre-tool-use version of this wrapper.

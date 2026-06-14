@@ -833,11 +833,13 @@ def run_harness(
     proposals: list[PortfolioProposal] = []
     evaluations: list[EvaluationResult] = []
     feedback: str | None = None
+    previous_proposal: PortfolioProposal | None = None
 
     for i in range(1, MAX_ITERATIONS + 1):
         # --- Step 2: Generate ---
         proposal = run_generator(
             spec, feedback=feedback, iteration=i, max_loss=TARGET_MAX_LOSS,
+            previous_proposal=previous_proposal,
         )
 
         # --- Step 3: Evaluate ---
@@ -885,7 +887,10 @@ def run_harness(
         else:
             print("❌  Failed QA — feeding critique back to generator.\n")
 
+        # Carry BOTH the critique and the portfolio it refers to into the next
+        # round (set together so they always describe the same iteration).
         feedback = _build_feedback(evaluation, proposal)
+        previous_proposal = proposal
 
     # --- Step 4: Select the best passing iteration ---
     selected_idx = _select_best_iteration(history)
