@@ -288,6 +288,98 @@ def _push_correlation_section(push: Any, result: dict[str, Any]) -> None:
         push("")
 
 
+def _push_loss_floor_section(push: Any, result: dict[str, Any]) -> None:
+    """
+    Render the 'Loss-Floor Compliance (delivered book)' section.
+
+    A deterministic backtest of the HELD allocations vs the annual loss cap
+    (see ``loss_floor.py``).  It exists to make a specific failure visible:
+    the pipeline can certify ``≤cap`` by crediting an enforcement mechanism
+    (e.g. an options overlay) that lives only in the spec, while the delivered
+    holdings are long-only and unhedged.  This section reports the GROSS
+    calendar-year losses of the actual holdings and flags when the ``≤cap``
+    claim depends on a hedge the portfolio does not hold.
+    """
+    lf = result.get("loss_floor") or {}
+    title = "## Loss-Floor Compliance (delivered book)"
+    if lf.get("performed"):
+        push(title)
+        push("")
+        if lf.get("disclaimer"):
+            push(f"> ⚠️ **How to read this.** {lf['disclaimer']}")
+            push("")
+
+        cap = float(lf.get("max_loss", 0.05) or 0.05)
+        worst = lf.get("worst_gross_annual_loss")
+        wy = lf.get("worst_year")
+        legs = lf.get("hedge_legs") or []
+
+        if lf.get("relies_on_unheld_mechanism"):
+            push(
+                f"> ❌ **NOT COMPLIANT AS DELIVERED.** The listed holdings lost "
+                f"**{worst:.1%} gross in {wy}** (cap **−{cap:.0%}**) and hold "
+                f"**no hedge leg** — the ≤{cap:.0%} claim depends on a mechanism "
+                f"(e.g. an options overlay) that is **not in this portfolio**. "
+                f"A reader who buys these weights is unhedged."
+            )
+        elif lf.get("organic_pass"):
+            push(
+                f"> ✅ **Organically compliant.** Worst gross calendar-year loss "
+                f"was **{worst:.1%}** ({wy}), within the **−{cap:.0%}** cap "
+                f"without relying on any hedge."
+            )
+        elif worst is not None:
+            leg_s = ", ".join(f"`{t}`" for t in legs) or "—"
+            push(
+                f"> ⚠️ **Hedged book.** Gross loss breaches the cap "
+                f"(**{worst:.1%}** in {wy}), but the portfolio HOLDS a hedge "
+                f"leg ({leg_s}); compliance depends on that held overlay "
+                f"performing as designed."
+            )
+        else:
+            push(f"_Could not judge: {lf.get('skipped_reason') or 'no usable data'}._")
+        push("")
+
+        per_year = lf.get("per_year") or []
+        if per_year:
+            push(
+                "Gross calendar-year backtest of the DELIVERED holdings "
+                "(proxy-substituted for pre-inception coverage):"
+            )
+            push("")
+            push("| Year | Gross annual return | Max drawdown | Coverage | vs cap |")
+            push("|------|--------------------:|-------------:|---------:|:-------|")
+            for p in per_year:
+                tr = p.get("gross_annual_return")
+                if tr is None:
+                    push(f"| {p.get('year', '')} | _no data_ | — | — | — |")
+                    continue
+                dd = p.get("gross_max_drawdown")
+                cov = float(p.get("coverage_weight", 0) or 0)
+                breach = "❌ breach" if p.get("breaches_cap") else "✅ ok"
+                dd_s = f"{dd:.1%}" if isinstance(dd, (int, float)) else "—"
+                push(
+                    f"| {p.get('year', '')} | {tr:+.1%} | {dd_s} | "
+                    f"{cov:.0%} | {breach} |"
+                )
+            push("")
+        subs = lf.get("proxy_substitutions") or []
+        if subs:
+            sub_s = ", ".join(f"`{s['original']}`→`{s['proxy']}`" for s in subs)
+            push(f"- **Proxy substitutions (for coverage):** {sub_s}")
+            push("")
+    elif lf.get("skipped_reason"):
+        push(title)
+        push("")
+        push(f"_Loss-floor check skipped — {lf['skipped_reason']}._")
+        push("")
+    elif lf.get("error"):
+        push(title)
+        push("")
+        push(f"_Loss-floor check could not run — {lf['error']}_")
+        push("")
+
+
 # ---------------------------------------------------------------------------
 # Horizon / posture header line (shared by both regimes)
 # ---------------------------------------------------------------------------
@@ -420,6 +512,9 @@ def _write_preservation_report(result: dict[str, Any], path: str) -> None:
     # ---- Correlation snapshot (no-LLM step, populated) ----
     _push_correlation_section(push, result)
 
+    # ---- Loss-floor compliance (no-LLM step) ----
+    _push_loss_floor_section(push, result)
+
     with open(path, "w") as f:
         f.write("\n".join(out))
 
@@ -516,6 +611,28 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
         )
     elif pricing_hdr.get("skipped_reason"):
         push(f"- **Pricing:** skipped ({pricing_hdr['skipped_reason']})")
+    loss_floor_hdr = result.get("loss_floor") or {}
+    if loss_floor_hdr.get("performed"):
+        wl = loss_floor_hdr.get("worst_gross_annual_loss")
+        wy = loss_floor_hdr.get("worst_year")
+        if loss_floor_hdr.get("relies_on_unheld_mechanism"):
+            push(
+                f"- **⚠️ Loss-floor:** NOT compliant as delivered — lost "
+                f"{wl:.1%} gross in {wy} with no hedge held; the ≤{target:.0%} "
+                f"claim relies on a mechanism NOT in the portfolio"
+            )
+        elif loss_floor_hdr.get("organic_pass"):
+            push(
+                f"- **Loss-floor:** organically within {target:.0%} "
+                f"(worst gross {wl:.1%} in {wy})"
+            )
+        elif wl is not None:
+            push(
+                f"- **Loss-floor:** breaches {target:.0%} gross "
+                f"({wl:.1%} in {wy}) but holds a hedge leg"
+            )
+    elif loss_floor_hdr.get("skipped_reason"):
+        push(f"- **Loss-floor:** skipped ({loss_floor_hdr['skipped_reason']})")
     push(f"- **Target max loss:** {target:.1%}")
     push(f"- **Pass threshold:** average score ≥ {pass_threshold} with no single score ≤ 4 AND evaluator says passed")
     push("")
@@ -798,6 +915,9 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
 
     # ---- Correlation snapshot (computed, no LLM) ----
     _push_correlation_section(push, result)
+
+    # ---- Loss-floor compliance (no-LLM step) ----
+    _push_loss_floor_section(push, result)
 
     # ---- Per-iteration detail ----
     push("## Iteration History (detailed)")

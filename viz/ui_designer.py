@@ -241,6 +241,24 @@ SYSTEM_PROMPT = textwrap.dedent("""\
         "n_sims": int, "block_days": int,
         "disclaimer": str,
         "error": str | null               # set if the profile could not run
+      },
+      "loss_floor": {                     # deterministic loss-floor compliance (no LLM)
+        "performed": bool,
+        "skipped_reason": str | null,     # set when skipped (--no-loss-floor / --test)
+        "max_loss": float,                # the annual loss cap, e.g. 0.05
+        "per_year": [                     # calendar-year backtest of the DELIVERED book
+          {"year": int, "gross_annual_return": float, "gross_max_drawdown": float,
+           "coverage_weight": float, "breaches_cap": bool}, ...
+        ],
+        "worst_gross_annual_loss": float, # worst gross calendar-year total return
+        "worst_year": int,
+        "holds_hedge_leg": bool,          # does the book actually HOLD a put/option/hedge?
+        "hedge_legs": [ticker, ...],
+        "organic_pass": bool,             # within the cap on its own, no hedge credited
+        "relies_on_unheld_mechanism": bool,  # KEY FLAG: breaches cap gross AND no hedge held
+        "proxy_substitutions": [{"original": ticker, "proxy": ticker}, ...],
+        "disclaimer": str,
+        "error": str | null
       }
     }
 
@@ -249,6 +267,18 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     --no-risk, or carry an `error` when offline).  Handle absence
     gracefully — hide the corresponding section rather than rendering
     empty placeholders.
+
+    LOSS-FLOOR COMPLIANCE — render honestly.  The `loss_floor` block is the
+    deterministic truth about whether the DELIVERED holdings meet the loss
+    cap on their own.  If `loss_floor.relies_on_unheld_mechanism` is true,
+    render a PROMINENT warning (not a pass): the listed holdings breach the
+    cap GROSS (show `worst_gross_annual_loss` / `worst_year` and the
+    `per_year` table) and hold NO hedge, so the "≤cap" headline depends on a
+    mechanism (e.g. an options overlay) that is NOT in the portfolio.  Do NOT
+    present a post-overlay / post-mechanism number as the headline compliance
+    figure when this flag is set — the deliverable is unhedged.  When
+    `organic_pass` is true, show it as a genuine pass.  When the book holds a
+    hedge leg (`holds_hedge_leg`), say compliance depends on that held overlay.
 
     When `mode == "preservation"` (short horizon — the optimizer was
     deliberately bypassed), tell the PRESERVATION STORY: the deterministic
