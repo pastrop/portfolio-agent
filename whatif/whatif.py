@@ -1,26 +1,31 @@
 """
-whatif.py — deterministic "what-if" scenario tool for a completed run.
+whatif.py — deterministic portfolio risk analysis (no LLM, no API key).
 
-Take a finished ``harness_output.json``, apply edits to the final portfolio
-(substitute / set / remove a security), and report the DETERMINISTIC
-before/after deltas — return, drawdown, and the all-important loss-cap verdict
-— WITHOUT rerunning the LLM pipeline.
+Two modes:
+  • EDIT mode    — take a finished ``harness_output.json``, edit the final
+                   portfolio (substitute / set / remove a security), and report
+                   the DETERMINISTIC before/after deltas (return, drawdown, and
+                   the all-important loss-cap verdict).
+  • DIRECT mode  — analyze a portfolio YOU supply (``--portfolio`` inline or
+                   ``--portfolio-file``) and emit a standalone risk report. No
+                   baseline to compare against; no comparison produced.
 
-Standalone, like ``viz/ui_designer.py``: it reads ``harness_output.json`` as a
-black box and never touches the harness.  It DOES reuse the harness's
-allocation-first, LLM-free eval core (``loss_floor`` / ``risk`` / ``correlation``
-/ ``pricing`` / ``tools.compute_backtest``) and ``report.py``'s section
-renderers — so the only genuinely new code here is edit-application, the
-single-name flag, and the before/after comparison.  No API key needed.
+Standalone, like ``viz/ui_designer.py``: it reads its inputs as black boxes and
+never touches the harness.  It DOES reuse the harness's allocation-first,
+LLM-free eval core (``loss_floor`` / ``risk`` / ``correlation`` / ``pricing`` /
+``tools.compute_backtest``) and ``report.py``'s section renderers.  Both modes
+emit a STANDARD harness-schema ``.json`` so ``viz/ui_designer.py`` renders it
+like any run.  No API key needed.
 
 Design + locked decisions: see SESSION_NOTES.md → "What-If scenario tool".
 
-Five composable functions (CLI / REPL / NL all become thin drivers):
-    load_baseline → apply_edits → evaluate → compare → render
-
 Usage:
+    # EDIT mode (before/after)
     uv run python whatif/whatif.py harness_output.json --substitute SPY=NVDA -o nvda
     uv run python whatif/whatif.py harness_output.json --set GLD=0.10 --remove VNQ
+    # DIRECT mode (standalone) — inline or file
+    uv run python whatif/whatif.py --portfolio "SCHD=0.24,VTV=0.20,SGOV=0.56" -o my_book
+    uv run python whatif/whatif.py --portfolio-file my_book.json
 """
 
 from __future__ import annotations
@@ -108,12 +113,86 @@ def _concentration(allocations: dict, qtypes: dict[str, str]) -> dict[str, Any]:
 
 
 # ===========================================================================
-# 1. load_baseline
+# 1. inputs — a baseline run (edit mode) OR a portfolio you supply (direct mode)
 # ===========================================================================
 def load_baseline(path: str) -> dict:
     """Read a completed ``harness_output.json`` (READ-ONLY)."""
     with open(path) as f:
         return json.load(f)
+
+
+def _normalize_weights(raw: dict) -> tuple[dict, list[str]]:
+    """Upper-case tickers, drop ≤0 weights, renormalize to 1.0 (never silent —
+    any rescale lands in ``notes``).  Weights are fractions."""
+    alloc: dict[str, float] = {}
+    for t, w in raw.items():
+        try:
+            wf = float(w)
+        except (TypeError, ValueError):
+            raise ValueError(f"weight for {t!r} must be a number, got {w!r}")
+        if wf < 0:
+            raise ValueError(f"weight for {t!r} is negative ({wf})")
+        if wf <= _WEIGHT_EPS:
+            continue
+        tk = str(t).strip().upper()
+        alloc[tk] = alloc.get(tk, 0.0) + wf
+    if not alloc:
+        raise ValueError("portfolio has no positive-weight holdings")
+    notes: list[str] = []
+    s = sum(alloc.values())
+    if abs(s - 1.0) > 1e-6:
+        for t in alloc:
+            alloc[t] /= s
+        notes.append(f"renormalized to 100% (input summed to {s:.2f})")
+    return {t: round(w, 6) for t, w in alloc.items()}, notes
+
+
+def parse_portfolio_string(s: str) -> dict:
+    """Parse ``'SCHD=0.24,VTV=0.20,…'`` → ``{ticker: weight}`` (fractions)."""
+    raw: dict[str, float] = {}
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"--portfolio: expected TICKER=WEIGHT, got '{part}'")
+        t, w = part.split("=", 1)
+        try:
+            raw[t.strip()] = float(w.strip())
+        except ValueError:
+            raise ValueError(f"--portfolio: weight for {t.strip()} must be a number, "
+                             f"got '{w.strip()}'")
+    if not raw:
+        raise ValueError("--portfolio is empty")
+    return raw
+
+
+def load_portfolio_file(path: str) -> tuple[dict, dict]:
+    """
+    Load a portfolio JSON.  Two accepted shapes:
+      • bare map:           ``{"SCHD": 0.24, "VTV": 0.20, …}``
+      • self-contained scenario:
+            ``{"allocations": {…}, "max_loss": 0.05, "horizon_years": 5,
+               "capital": 100000}``
+
+    Returns ``(raw_allocations, file_assumptions)``.  Assumptions present in the
+    file are used unless a CLI flag overrides them (flag > file > default).
+    """
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a JSON object")
+    assumptions: dict = {}
+    if "allocations" in data:
+        raw = data.get("allocations")
+        for k in ("max_loss", "horizon_years", "capital"):
+            if data.get(k) is not None:
+                assumptions[k] = data[k]
+    else:
+        raw = data
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"{path}: no allocations found")
+    return raw, assumptions
 
 
 # ===========================================================================
@@ -404,45 +483,45 @@ def _delta(before, after):
     return None
 
 
-def _modified_result(baseline: dict, modified_eval: dict, notes: list[str],
-                     target_max_loss: float, horizon_years: int | None) -> dict:
+def _schema_result(eval_result: dict, *, baseline: dict | None, notes: list[str],
+                   target_max_loss: float, horizon_years: int | None,
+                   methodology: str, rationale: str) -> dict:
     """
-    Build the modified book as a STANDARD harness-schema result — nothing more,
-    so ``viz/ui_designer.py`` renders it like any run with NO designer changes.
+    Build a portfolio as a STANDARD harness-schema result, so
+    ``viz/ui_designer.py`` renders it like any run with NO designer changes.
+    Shared by both modes:
+      • EDIT mode   → ``baseline`` is the source run (model / spec / posture copied).
+      • DIRECT mode → ``baseline`` is None (model / spec / posture null; the
+                       designer hides the spec / QA / iteration panels, since none
+                       of those exist for a user-supplied book).
 
-    ASSUMPTIONS (documented per request — this file is for VISUALIZING the
-    resulting portfolio, not the comparison):
-      • Output is the edited portfolio in the existing harness schema. No custom
-        mode, no comparison block. The before/after deltas live in the CLI
-        output + the ``whatif_<label>.md`` report, where they belong.
-      • The LLM-only fields (``final_evaluation``, ``iteration_history``,
-        ``expected_annual_return`` / ``_max_drawdown``) are null/empty because a
-        deterministic edit never ran the Evaluator or iterated. The designer is
-        already told to hide missing/null sections gracefully, so the QA /
-        iteration panels simply don't render.
-      • ``mode="optimized"`` is only a RENDERING hint (use the normal dashboard);
-        the edit's provenance lives within-schema in
-        ``final_proposal.methodology`` / ``rationale``.
+    ASSUMPTIONS (documented): the LLM-only fields (``final_evaluation``,
+    ``iteration_history``, ``expected_annual_return`` / ``_max_drawdown``) are
+    null/empty because no LLM ran — the designer is already told to hide
+    missing/null sections gracefully.  ``mode="optimized"`` is only a rendering
+    hint; provenance lives within-schema in ``final_proposal.methodology`` /
+    ``rationale``.  The comparison (edit mode) lives in the CLI + .md, NOT here.
     """
-    alloc = modified_eval["allocations"]
-    base_fp = baseline.get("final_proposal") or {}
+    b = baseline or {}
+    alloc = eval_result["allocations"]
+    base_fp = b.get("final_proposal") or {}
     return {
-        "model": baseline.get("model"),
-        "max_iterations": baseline.get("max_iterations"),
-        "pass_threshold": baseline.get("pass_threshold"),
+        "model": b.get("model"),
+        "max_iterations": b.get("max_iterations"),
+        "pass_threshold": b.get("pass_threshold"),
         "target_max_loss": target_max_loss,
         "mode": "optimized",
         "horizon_years": horizon_years,
-        "horizon_posture": baseline.get("horizon_posture"),
-        "spec": baseline.get("spec"),
+        "horizon_posture": b.get("horizon_posture"),
+        "spec": b.get("spec"),
         "final_proposal": {
             "allocations": alloc,
             "descriptions": {t: (base_fp.get("descriptions") or {}).get(t, "")
                              for t in alloc},
-            "expected_annual_return": None,   # LLM assertion — absent for a deterministic edit
+            "expected_annual_return": None,   # LLM assertion — absent (no LLM ran)
             "expected_max_drawdown": None,
-            "methodology": "What-if edit of a completed run (deterministic; no LLM).",
-            "rationale": "Edits: " + ("; ".join(notes) if notes else "none"),
+            "methodology": methodology,
+            "rationale": rationale,
             "raw_text": "",
         },
         "final_evaluation": None,        # null → designer hides the QA section
@@ -451,13 +530,13 @@ def _modified_result(baseline: dict, modified_eval: dict, notes: list[str],
         "selected_evaluation": None,
         "iteration_history": [],
         "refinement": {"performed": False,
-                       "skipped_reason": "what-if edit — no optimisation loop",
+                       "skipped_reason": "deterministic what-if/analysis — no optimisation loop",
                        "promoted": False, "refined_proposal": None,
                        "refined_evaluation": None, "improvements": None},
-        "pricing": modified_eval["blocks"]["pricing"],
-        "risk_profile": modified_eval["blocks"]["risk_profile"],
-        "correlation": modified_eval["blocks"]["correlation"],
-        "loss_floor": modified_eval["blocks"]["loss_floor"],
+        "pricing": eval_result["blocks"]["pricing"],
+        "risk_profile": eval_result["blocks"]["risk_profile"],
+        "correlation": eval_result["blocks"]["correlation"],
+        "loss_floor": eval_result["blocks"]["loss_floor"],
     }
 
 
@@ -526,8 +605,12 @@ def render(baseline: dict, modified_eval: dict, comparison: dict, *,
 
     The .json is a standard-schema modified portfolio (for the designer); the
     .md carries the before/after comparison."""
-    result = _modified_result(baseline, modified_eval, notes,
-                              target_max_loss, horizon_years)
+    result = _schema_result(
+        modified_eval, baseline=baseline, notes=notes,
+        target_max_loss=target_max_loss, horizon_years=horizon_years,
+        methodology="What-if edit of a completed run (deterministic; no LLM).",
+        rationale="Edits: " + ("; ".join(notes) if notes else "none"),
+    )
 
     json_path = os.path.join(out_dir, f"whatif_{label}.json")
     with open(json_path, "w") as f:
@@ -548,6 +631,73 @@ def render(baseline: dict, modified_eval: dict, comparison: dict, *,
     push("---")
     push("")
     push("### Modified book — full deterministic detail")
+    push("")
+    _push_loss_floor_section(push, result)
+    _push_risk_section(push, result)
+    _push_correlation_section(push, result)
+    _push_pricing_section(push, result)
+
+    md_path = os.path.join(out_dir, f"whatif_{label}.md")
+    with open(md_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return json_path, md_path
+
+
+def _render_standalone(eval_result: dict, *, notes: list[str], target_max_loss: float,
+                       horizon_years: int | None, capital: float, label: str,
+                       out_dir: str = ".") -> tuple[str, str]:
+    """Write whatif_<label>.{json,md} for a STANDALONE portfolio (direct mode,
+    no comparison).  The .json is standard harness schema (for the designer);
+    the .md is a single-portfolio risk report."""
+    alloc = eval_result["allocations"]
+    result = _schema_result(
+        eval_result, baseline=None, notes=notes, target_max_loss=target_max_loss,
+        horizon_years=horizon_years,
+        methodology="User-specified portfolio (deterministic risk analysis; no LLM).",
+        rationale=f"Standalone analysis of a {len(alloc)}-holding portfolio.",
+    )
+    json_path = os.path.join(out_dir, f"whatif_{label}.json")
+    with open(json_path, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+
+    lines: list[str] = []
+    push = lines.append
+    push(f"# Portfolio Risk Analysis: {label}")
+    push("")
+    push(f"User-specified portfolio — deterministic analysis, no LLM. Assumptions: "
+         f"loss cap ≤{target_max_loss:.0%}, horizon {horizon_years}y, "
+         f"capital ${capital:,.0f}.")
+    if notes:
+        push("")
+        push("**Note:** " + "; ".join(notes))
+    push("")
+    push("**Holdings:**")
+    for t, w in sorted(alloc.items(), key=lambda kv: -kv[1]):
+        push(f"- `{t}` — {w:.1%}")
+    push("")
+
+    lf = eval_result["blocks"]["loss_floor"]
+    if lf.get("performed") and lf.get("worst_gross_annual_loss") is not None:
+        within = "within" if lf.get("organic_pass") else "**BREACHES**"
+        push(f"> **Loss cap:** worst stress-year loss "
+             f"{_fmt_pct(lf['worst_gross_annual_loss'])} ({lf.get('worst_year')}) — "
+             f"{within} the ≤{target_max_loss:.0%} cap.")
+        push("")
+
+    con = eval_result["concentration"]
+    singles = f" ({', '.join(con['single_names'])})" if con["single_names"] else ""
+    push(f"**Concentration:** effective-N {con['effective_n']}; largest holding "
+         f"`{con['max_name']}` {_fmt_pct(con['max_name_weight'], 0)}; single-name equity "
+         f"{_fmt_pct(con['single_name_weight'], 0)}{singles}.")
+    tb = eval_result["trailing"]
+    if tb and tb.get("ok"):
+        push("")
+        push(f"**Trailing {tb['years']}y:** return {_fmt_pct(tb['total_return'])}, "
+             f"vol {_fmt_pct(tb['annualised_vol'], 0)}, max drawdown {_fmt_pct(tb['max_drawdown'])}.")
+    push("")
+    push("---")
+    push("")
+    push("### Full deterministic detail")
     push("")
     _push_loss_floor_section(push, result)
     _push_risk_section(push, result)
@@ -587,18 +737,40 @@ def _auto_label(ops: list[tuple]) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="whatif.py",
-        description="Deterministic what-if edits on a completed harness_output.json "
-                    "(no LLM, no API key).",
+        description="Deterministic portfolio risk analysis — no LLM, no API key. "
+                    "EDIT a completed harness_output.json "
+                    "(--substitute/--set/--remove → before/after comparison), OR "
+                    "ANALYZE a portfolio you supply (--portfolio / --portfolio-file → "
+                    "standalone risk report).",
     )
-    p.add_argument("baseline", help="path to a completed harness_output.json")
+    p.add_argument("baseline", nargs="?", default=None,
+                   help="path to a completed harness_output.json (EDIT mode; "
+                        "omit when using --portfolio / --portfolio-file)")
+    # --- direct (standalone) portfolio input ---
+    p.add_argument("--portfolio", metavar='"T=w,T=w,…"',
+                   help='analyze a portfolio you specify inline, fractions, e.g. '
+                        '"SCHD=0.24,VTV=0.20,SGOV=0.56"')
+    p.add_argument("--portfolio-file", metavar="PATH",
+                   help="analyze a portfolio from a JSON file: a bare {ticker: weight} "
+                        "map, OR {\"allocations\": {…}, \"max_loss\":…, "
+                        "\"horizon_years\":…, \"capital\":…}")
+    # --- edits (EDIT mode) ---
     p.add_argument("--substitute", dest="edits", action=_EditAction, metavar="A=B",
                    help="move A's weight to B (e.g. SPY=NVDA). Repeatable.")
     p.add_argument("--set", dest="edits", action=_EditAction, metavar="TICKER=WEIGHT",
                    help="pin TICKER at WEIGHT (fraction, e.g. GLD=0.10); others fill the rest.")
     p.add_argument("--remove", dest="edits", action=_EditAction, metavar="TICKER",
                    help="drop TICKER; the rest renormalize. Repeatable.")
+    # --- assumptions: explicit flag > baseline/file > default (0.05 / 5y / 100K) ---
+    p.add_argument("--max-loss", type=float, default=None, metavar="FRACTION",
+                   help="annual loss cap (direct-mode default 0.05; else from baseline/file)")
+    p.add_argument("--horizon-years", type=int, default=None,
+                   help="investment horizon, years (direct-mode default 5; else from baseline/file)")
+    p.add_argument("--capital", type=float, default=None,
+                   help="capital for the lot-size check (direct-mode default 100000; else from baseline/file)")
+    # --- output ---
     p.add_argument("-o", "--label", default=None,
-                   help="output label → whatif_<label>.{json,md} (auto from edits if omitted)")
+                   help="output label → whatif_<label>.{json,md} (auto if omitted)")
     p.add_argument("--trailing-years", type=int, default=5,
                    help="trailing backtest window in years (default 5)")
     p.add_argument("--out-dir", default=".", help="output directory (default cwd)")
@@ -607,10 +779,35 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    raw_edits = getattr(args, "edits", None) or []
-    if not raw_edits:
-        print("ERROR: no edits given (use --substitute / --set / --remove).", file=sys.stderr)
+    direct = bool(args.portfolio or args.portfolio_file)
+    edits = getattr(args, "edits", None) or []
+
+    if direct:
+        if args.baseline or edits:
+            print("ERROR: --portfolio / --portfolio-file is STANDALONE — don't combine it "
+                  "with a harness_output.json baseline or --substitute/--set/--remove.",
+                  file=sys.stderr)
+            return 2
+        if args.portfolio and args.portfolio_file:
+            print("ERROR: give either --portfolio or --portfolio-file, not both.",
+                  file=sys.stderr)
+            return 2
+        return _run_direct(args)
+
+    # --- EDIT mode ---
+    if not args.baseline:
+        print("ERROR: give a completed harness_output.json (+ edits), or use "
+              "--portfolio / --portfolio-file for a standalone book.", file=sys.stderr)
         return 2
+    if not edits:
+        print("ERROR: no edits given (use --substitute / --set / --remove), or use "
+              "--portfolio / --portfolio-file for a standalone analysis.", file=sys.stderr)
+        return 2
+    return _run_edit(args, edits)
+
+
+def _run_edit(args, raw_edits: list) -> int:
+    """EDIT mode: harness_output.json + edits → before/after comparison."""
     try:
         ops = _parse_edits(raw_edits)
     except ValueError as exc:
@@ -625,10 +822,13 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: baseline has no final_proposal.allocations to edit.", file=sys.stderr)
         return 1
 
-    # Threaded assumptions (decision 7): identical for both sides.
-    target_max_loss = float(baseline.get("target_max_loss") or 0.05)
-    horizon_years = baseline.get("horizon_years")
-    capital = float((baseline.get("pricing") or {}).get("capital") or DEFAULT_CAPITAL)
+    # Assumptions: explicit flag > baseline value > default.
+    target_max_loss = (args.max_loss if args.max_loss is not None
+                       else float(baseline.get("target_max_loss") or 0.05))
+    horizon_years = (args.horizon_years if args.horizon_years is not None
+                     else baseline.get("horizon_years"))
+    capital = (args.capital if args.capital is not None
+               else float((baseline.get("pricing") or {}).get("capital") or DEFAULT_CAPITAL))
     descriptions = base_fp.get("descriptions") or {}
 
     try:
@@ -639,15 +839,12 @@ def main(argv: list[str] | None = None) -> int:
 
     label = args.label or _auto_label(ops)
     edits_repr = [(" ".join(str(x) for x in op)) for op in ops]
-
     print(f"\nWHAT-IF: {label}")
     print("Edits:", "; ".join(edits_repr))
     for n in notes:
         print(f"  · {n}")
 
-    # One quoteType lookup over the union of both books.
     qtypes = _security_types(set(baseline_alloc) | set(modified_alloc))
-
     print("Evaluating baseline (reusing computed blocks where present) …")
     base_eval = evaluate(baseline_alloc, descriptions=descriptions,
                          target_max_loss=target_max_loss, horizon_years=horizon_years,
@@ -661,7 +858,6 @@ def main(argv: list[str] | None = None) -> int:
 
     comparison = compare(base_eval, mod_eval,
                          target_max_loss=target_max_loss, horizon_years=horizon_years)
-
     json_path, md_path = render(baseline, mod_eval, comparison,
                                 edits_repr=edits_repr, notes=notes,
                                 target_max_loss=target_max_loss,
@@ -671,6 +867,53 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n{comparison['loss_cap_verdict']}")
     if comparison["loss_cap"]["flipped_to_breach"]:
         print("⚠️  This edit FLIPS the loss cap to BREACHED.")
+    print(f"\nWrote {json_path}\n      {md_path}")
+    return 0
+
+
+def _run_direct(args) -> int:
+    """DIRECT mode: a user-supplied portfolio → standalone risk analysis."""
+    try:
+        if args.portfolio_file:
+            raw, file_assump = load_portfolio_file(args.portfolio_file)
+        else:
+            raw, file_assump = parse_portfolio_string(args.portfolio), {}
+        alloc, notes = _normalize_weights(raw)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    # Assumptions: explicit flag > file value > default (5% / 5y / 100K).
+    max_loss = (args.max_loss if args.max_loss is not None
+                else float(file_assump.get("max_loss", 0.05)))
+    horizon = (args.horizon_years if args.horizon_years is not None
+               else int(file_assump.get("horizon_years", 5)))
+    capital = (args.capital if args.capital is not None
+               else float(file_assump.get("capital", 100000.0)))
+
+    label = args.label or "portfolio"
+    print(f"\nPORTFOLIO ANALYSIS: {label}")
+    print("Holdings:", "; ".join(f"{t} {w:.1%}"
+                                 for t, w in sorted(alloc.items(), key=lambda kv: -kv[1])))
+    print(f"Assumptions: cap ≤{max_loss:.0%}, horizon {horizon}y, capital ${capital:,.0f}")
+    for n in notes:
+        print(f"  · {n}")
+
+    qtypes = _security_types(set(alloc))
+    print("Evaluating portfolio …")
+    eval_ = evaluate(alloc, descriptions={}, target_max_loss=max_loss,
+                     horizon_years=horizon, capital=capital, qtypes=qtypes,
+                     trailing_years=args.trailing_years, precomputed=None)
+
+    json_path, md_path = _render_standalone(eval_, notes=notes, target_max_loss=max_loss,
+                                            horizon_years=horizon, capital=capital,
+                                            label=label, out_dir=args.out_dir)
+
+    lf = eval_["blocks"]["loss_floor"]
+    if lf.get("performed") and lf.get("worst_gross_annual_loss") is not None:
+        verdict = "within" if lf.get("organic_pass") else "BREACHES"
+        print(f"\nLoss cap ≤{max_loss:.0%}: worst stress-year loss "
+              f"{lf['worst_gross_annual_loss']:+.1%} ({lf.get('worst_year')}) — {verdict}.")
     print(f"\nWrote {json_path}\n      {md_path}")
     return 0
 
